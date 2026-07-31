@@ -22,7 +22,8 @@ cd "$(dirname "$0")/.."
 BUILD="build-host"
 SODIUM_ROOT="third_party/libsodium/libsodium-1.0.20"
 SODIUM_INC="$SODIUM_ROOT/src/libsodium/include"
-[ -f "$SODIUM_INC/sodium.h" ] || { echo "libsodium not vendored — run ./scripts/fetch_libsodium.sh" >&2; exit 1; }
+[ -f "$SODIUM_INC/sodium.h" ] || ./third_party/fetch_deps.sh libsodium
+[ -f "$SODIUM_INC/sodium.h" ] || { echo "libsodium still missing — run ./third_party/fetch_deps.sh libsodium" >&2; exit 1; }
 
 # --- native host compiler (never ZIG_BIN, never EXTRA_CXXFLAGS) --------------
 CXX="${HOST_CXX:-}"

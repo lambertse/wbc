@@ -31,7 +31,7 @@ Because native obfuscation is **semantics-preserving**, the full test suite
   `arm64-v8a` cross-compile**, not a macOS/x86-64 host build. `zig`'s bundled
   clang won't match the plugin.
 - Each plugin is pinned to a specific NDK. This repo ships the
-  **NDK r29 / O-MVLL v1.9.1** plugin (`obfuscation/omvll_ndk_r29.dylib`, Mach-O
+  **NDK r29 / O-MVLL v1.9.1** plugin (`third_party/omvll/omvll_ndk_r29.dylib`, Mach-O
   arm64). See [BUILD.md → Option C](BUILD.md#option-c--with-native-code-obfuscation-o-mvll)
   for the full, step-by-step setup (NDK install, macOS code-signing, Python
   stdlib, CMake/Ninja invocation) — that is the authoritative build recipe.
@@ -63,7 +63,7 @@ host-compatible plugin, but that is not the tested configuration.
 ## What to obfuscate
 
 Heavy obfuscation is slow and bloats size, so target the sensitive translation
-units (the template `obfuscation/omvll_config.py` matches these by module name):
+units (the template `third_party/omvll/omvll_config.py` matches these by module name):
 
 - `src/vm/vm.cpp`, `src/vm/handlers.cpp`, `src/vm/assembler.cpp` — the interpreter
   and the tables→bytecode compiler.

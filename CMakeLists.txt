@@ -1,6 +1,6 @@
 # Portable build for standard toolchains. Mirrors build.sh (the tested path in
-# the dev environment, which has no system cmake). Usage:
-#   ./scripts/fetch_libsodium.sh          # vendor the crypto dependency once
+# the dev environment, which has no system cmake). Dependencies are vendored
+# automatically at configure time by third_party/fetch_deps.sh. Usage:
 #   cmake -S . -B build && cmake --build build && ctest --test-dir build
 cmake_minimum_required(VERSION 3.16)
 # C is enabled because the SDK integration example (examples/example.c) is C and
@@ -23,30 +23,77 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 add_compile_options(-ffunction-sections -fdata-sections)
 
+# ---- third-party dependency fetcher ----------------------------------------
+# third_party/fetch_deps.sh vendors deps into third_party/ (pinned + SHA256,
+# idempotent). CMake runs it at configure time so a fresh checkout never fails
+# with "dependency not vendored" — it replaces the old manual step you could
+# forget. Targets: libsodium | python | omvll | all.
+find_program(BASH_PROGRAM bash)
+function(fetch_dep target)
+  if(NOT BASH_PROGRAM)
+    message(FATAL_ERROR "bash not found; run ./third_party/fetch_deps.sh ${target} by hand")
+  endif()
+  message(STATUS "==> fetching third-party dependency: ${target}")
+  execute_process(
+    COMMAND ${BASH_PROGRAM} ${CMAKE_SOURCE_DIR}/third_party/fetch_deps.sh ${target}
+    RESULT_VARIABLE _fetch_rc)
+  if(NOT _fetch_rc EQUAL 0)
+    message(FATAL_ERROR "fetch_deps.sh ${target} failed (rc=${_fetch_rc}); check network/URL")
+  endif()
+endfunction()
+
 # Opt-in native-code obfuscation (see docs/OBFUSCATION.md and docs/BUILD.md).
-# Point OMVLL_PLUGIN at an LLVM pass-plugin (e.g. O-MVLL) built for THIS clang's
-# version; empty by default so normal builds are unaffected. The fully tested
-# path is an Android NDK cross-compile — the plugin shipped in this repo,
-# obfuscation/omvll_ndk_r29.dylib, is a Mach-O arm64 dylib paired with NDK r29:
+# -DOMVLL=ON fetches the pinned O-MVLL plugin (+ its matching CPython 3.10 stdlib)
+# into third_party/ and wires -fpass-plugin automatically. The fully tested path
+# is an Android NDK cross-compile; the plugin, third_party/omvll/
+# omvll_ndk_r29.dylib, is a Mach-O arm64 dylib paired with NDK r29:
 #   cmake -GNinja -B build \
 #     -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-#     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
-#     -DOMVLL_PLUGIN=$PWD/obfuscation/omvll_ndk_r29.dylib
+#     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DOMVLL=ON
+# Advanced: set OMVLL_PLUGIN to your own plugin build to override the fetched one.
 # Do NOT also pass -fpass-plugin via CMAKE_CXX_FLAGS — that double-applies it.
-set(OMVLL_PLUGIN "" CACHE STRING "Path to an LLVM pass-plugin to load (e.g. O-MVLL)")
+option(OMVLL "Fetch and enable O-MVLL native-code obfuscation" OFF)
+set(OMVLL_PLUGIN "" CACHE STRING "Path to an LLVM pass-plugin to load (overrides -DOMVLL)")
+if(OMVLL AND NOT OMVLL_PLUGIN)
+  fetch_dep(omvll)
+  set(OMVLL_PLUGIN ${CMAKE_SOURCE_DIR}/third_party/omvll/omvll_ndk_r29.dylib)
+endif()
 if(OMVLL_PLUGIN)
+  # Restore the plugin binary if it was deleted. This also covers the explicit
+  # -DOMVLL_PLUGIN path (not just -DOMVLL=ON): if it points at the vendored
+  # location, re-fetch it; if it points at a custom build that's missing, fail
+  # loudly rather than handing clang a nonexistent -fpass-plugin.
+  if(NOT EXISTS ${OMVLL_PLUGIN})
+    if(OMVLL_PLUGIN STREQUAL "${CMAKE_SOURCE_DIR}/third_party/omvll/omvll_ndk_r29.dylib")
+      fetch_dep(omvll)
+    else()
+      message(FATAL_ERROR "OMVLL_PLUGIN=${OMVLL_PLUGIN} not found. Build your plugin, "
+        "point at the vendored one (third_party/omvll/omvll_ndk_r29.dylib), or use -DOMVLL=ON.")
+    endif()
+  endif()
+  # O-MVLL embeds a CPython VM that aborts ("failed to get the Python codec of
+  # the filesystem encoding") without a 3.10 stdlib at OMVLL_PYTHONPATH. Ensure
+  # it's vendored whenever obfuscation is on — including the explicit
+  # -DOMVLL_PLUGIN path, not just -DOMVLL=ON — so a deleted third_party/python is
+  # transparently restored. Point OMVLL_PYTHONPATH at third_party/python/Lib.
+  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/third_party/python/Lib/abc.py)
+    fetch_dep(python)
+  endif()
   message(STATUS "==> O-MVLL obfuscation: ON  (-fpass-plugin=${OMVLL_PLUGIN})")
   add_compile_options(-fpass-plugin=${OMVLL_PLUGIN})
   add_link_options(-Wl,-z,muldefs)
 else()
-  message(STATUS "==> O-MVLL obfuscation: OFF (pass -DOMVLL_PLUGIN=/path/to/plugin to enable)")
+  message(STATUS "==> O-MVLL obfuscation: OFF (pass -DOMVLL=ON to fetch+enable)")
 endif()
 
 # ---- vendored libsodium (seal KDF + AEAD) ----------------------------------
 set(SODIUM_ROOT ${CMAKE_SOURCE_DIR}/third_party/libsodium/libsodium-1.0.20)
 set(SODIUM_INC ${SODIUM_ROOT}/src/libsodium/include)
 if(NOT EXISTS ${SODIUM_INC}/sodium.h)
-  message(FATAL_ERROR "libsodium not vendored. Run: ./scripts/fetch_libsodium.sh")
+  fetch_dep(libsodium)
+endif()
+if(NOT EXISTS ${SODIUM_INC}/sodium.h)
+  message(FATAL_ERROR "libsodium still missing after fetch; run ./third_party/fetch_deps.sh libsodium")
 endif()
 file(GLOB_RECURSE SODIUM_SOURCES CONFIGURE_DEPENDS ${SODIUM_ROOT}/src/libsodium/*.c)
 add_library(sodium_obj OBJECT ${SODIUM_SOURCES})

@@ -49,7 +49,7 @@ for the full component-by-component implementation. All docs:
   derived from the passphrase by Argon2id (memory-hard, random per-blob salt),
   and the whole program header (VM code, opcode maps, sizes) is authenticated as
   associated data. A wrong passphrase or any tamper fails authentication, so the
-  blob does not open. Crypto is vendored libsodium (`scripts/fetch_libsodium.sh`),
+  blob does not open. Crypto is vendored libsodium (`third_party/fetch_deps.sh`),
   never home-rolled.
 
 ## Techniques from the deck → where they live
@@ -90,14 +90,14 @@ math — which is why the VM ISA is tiny.
 
 No system cmake is required by the build script — it discovers a C++17 compiler
 (`$CXX`/`$ZIG_BIN`, then system `c++`/`g++`/`clang++`). One dependency,
-**libsodium** (the seal's KDF+AEAD), is vendored from source with a one-time
-fetch. If you only have a Zig toolchain, drive it via `ZIG_BIN` (so `zig ar`/`zig
-cc` come along too):
+**libsodium** (the seal's KDF+AEAD), is vendored from source — `build.sh` fetches
+it automatically (pinned + SHA256). If you only have a Zig toolchain, drive it via
+`ZIG_BIN` (so `zig ar`/`zig cc` come along too):
 
 ```sh
-./scripts/fetch_libsodium.sh          # vendor libsodium once (pinned + SHA256)
-./build.sh test                       # build everything and run all tests
+./build.sh test                       # auto-fetches libsodium, builds, runs tests
 ZIG_BIN=/path/to/zig ./build.sh test  # when only a Zig toolchain is available
+./third_party/fetch_deps.sh           # (optional) vendor libsodium up front
 ```
 
 A `CMakeLists.txt` is also provided for standard toolchains (mirrors the script;

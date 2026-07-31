@@ -52,12 +52,16 @@ mkdir -p "$BUILD"
 
 # ---- vendored libsodium (seal KDF + AEAD) ----------------------------------
 # The runtime library links libsodium for Argon2id + XChaCha20-Poly1305. The
-# source is fetched, not committed; populate it with scripts/fetch_libsodium.sh.
+# source is fetched (not committed) by third_party/fetch_deps.sh — auto-run here
+# so a fresh checkout never has to remember it.
 SODIUM_VER="1.0.20"
 SODIUM_ROOT="third_party/libsodium/libsodium-${SODIUM_VER}"
 SODIUM_INC="$SODIUM_ROOT/src/libsodium/include"
 if [ ! -f "$SODIUM_INC/sodium.h" ]; then
-    echo "ERROR: libsodium not vendored. Run: ./scripts/fetch_libsodium.sh" >&2
+    ./third_party/fetch_deps.sh libsodium
+fi
+if [ ! -f "$SODIUM_INC/sodium.h" ]; then
+    echo "ERROR: libsodium still missing after fetch; run ./third_party/fetch_deps.sh libsodium" >&2
     exit 1
 fi
 

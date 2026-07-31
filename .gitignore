@@ -2,7 +2,16 @@
 *.o
 *.blob
 .DS_Store
-# Vendored dependency source (populated by scripts/fetch_libsodium.sh).
+__pycache__/
+*.pyc
+
+# Vendored third-party dependency trees (populated by third_party/fetch_deps.sh).
 third_party/libsodium/
 third_party/python/
+# O-MVLL: the fetched plugin binary, stamp, and download leftovers are ignored;
+# the hand-authored omvll_config.py stays tracked.
+third_party/omvll/*.dylib
+third_party/omvll/.vendored-ok
+third_party/*.tgz
+third_party/omvll/*.tar.gz
 /build-host/

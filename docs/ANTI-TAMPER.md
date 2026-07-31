@@ -15,7 +15,7 @@ existing floor; they do not create one — land the crypto/structure work first
 
 ## 1. Native-code obfuscation — O-MVLL (P2.1)
 
-`obfuscation/omvll_config.py` targets the sensitive **functions** (never whole
+`third_party/omvll/omvll_config.py` targets the sensitive **functions** (never whole
 modules — that overwhelms the backend; see the file's header) in the hot TUs:
 `vm.cpp`, `handlers.cpp`, `assembler.cpp`, `trusted_storage.cpp`, `fwcrypt.cpp`,
 the SDK glue, and the freestanding stub. Enabled passes:

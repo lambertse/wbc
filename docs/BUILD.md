@@ -8,15 +8,16 @@ portable `CMakeLists.txt` for standard toolchains.
 ## Requirements
 
 - A **C++17 compiler** (`clang++` 8+, `g++` 9+, or `zig c++`).
-- **libsodium source**, fetched once with a pinned version + SHA256:
+- **libsodium source**, vendored with a pinned version + SHA256. Both `build.sh`
+  and CMake fetch it automatically at build/configure time; to do it by hand:
 
   ```sh
-  ./scripts/fetch_libsodium.sh          # populates third_party/libsodium/ (not committed)
+  ./third_party/fetch_deps.sh libsodium  # populates third_party/libsodium/ (not committed)
   ```
 
   The build compiles libsodium from source (no autotools/`configure` needed —
   portable C is selected automatically), so no system crypto library is
-  required. Both `build.sh` and CMake error out with this hint if it is missing.
+  required. `fetch_deps.sh` is idempotent — it skips deps already vendored.
 
 ## Runtime vs provisioning (what ships)
 
@@ -107,7 +108,7 @@ freestanding caveat. This section covers just the build steps.
 | Host | macOS (Apple Silicon); clang `dlopen`s **Mach-O only** |
 | NDK | **r29** = `29.0.14206865` (`$ANDROID_HOME/ndk/29.0.14206865`) |
 | O-MVLL | **v1.9.1** (the release paired with NDK r29) |
-| Plugin file | `obfuscation/omvll_ndk_r29.dylib` — **Mach-O arm64**, *not* an ELF `.so` |
+| Plugin file | `third_party/omvll/omvll_ndk_r29.dylib` — **Mach-O arm64**, *not* an ELF `.so` |
 | Target ABI | `arm64-v8a` (O-MVLL supports AArch64 / AArch32 only) |
 | Build | Ninja + CMake with the NDK toolchain file |
 | Python stdlib | a CPython **3.10** `Lib/` directory, via `OMVLL_PYTHONPATH` |
@@ -115,16 +116,16 @@ freestanding caveat. This section covers just the build steps.
 O-MVLL pins each prebuilt plugin to a **specific** NDK/LLVM; the plugin must be
 loaded by the clang from that NDK or it won't load / will crash. As a rough guide
 (verify on the releases page — this is not authoritative): recent releases target
-**r26d** (v1.3.0–v1.8.0) or **r29** (v1.9.0–v1.9.1). This repo ships the
-**r29 / v1.9.1** plugin.
+**r26d** (v1.3.0–v1.8.0) or **r29** (v1.9.0–v1.9.1). This repo pins the
+**r29 / v1.9.1** plugin, fetched on demand by `third_party/fetch_deps.sh omvll`.
 
 ### Environment (export in the shell that runs both cmake and the build)
 
 ```sh
 export ANDROID_HOME="$HOME/Library/Android/sdk"
 export NDK="$ANDROID_HOME/ndk/29.0.14206865"
-export PLUGIN="$PWD/obfuscation/omvll_ndk_r29.dylib"
-export OMVLL_CONFIG="$PWD/obfuscation/omvll_config.py"
+export PLUGIN="$PWD/third_party/omvll/omvll_ndk_r29.dylib"
+export OMVLL_CONFIG="$PWD/third_party/omvll/omvll_config.py"
 export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"   # see step 4
 # macOS uses DYLD_LIBRARY_PATH (not LD_LIBRARY_PATH); the dir is darwin-x86_64
 # even on Apple Silicon:
@@ -136,12 +137,14 @@ a fresh terminal without them will fail.
 
 ### Setup, in order (each step fixes a real failure)
 
-1. **Install a matching NDK/plugin pair.** This repo ships the r29 plugin, so
-   install NDK r29:
+1. **Install a matching NDK/plugin pair.** This repo pins the r29 / v1.9.1
+   plugin (fetched into `third_party/omvll/`, not committed), so install NDK r29:
    ```sh
+   ./third_party/fetch_deps.sh omvll   # -> third_party/omvll/omvll_ndk_r29.dylib (+ python)
    "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.14206865"
    cat "$NDK/source.properties"      # expect: Pkg.Revision = 29.0.14206865
    ```
+   (`-DOMVLL=ON` at configure time fetches the plugin automatically too.)
    `sdkmanager` needs **JDK 17+** (it fails with "requires JDK 17 or later" on
    JDK 11). Either `brew install openjdk@17` and put it on `JAVA_HOME`/`PATH`, or
    for a one-off: `SKIP_JDK_VERSION_CHECK=1 sdkmanager "ndk;29.0.14206865"`.
@@ -185,11 +188,10 @@ a fresh terminal without them will fail.
    CPython VM and aborts with *"failed to get the Python codec of the filesystem
    encoding"* when it falls back to a nonexistent build-machine path. Fetch the
    matching CPython **3.10** source (only its pure-Python `Lib/` is used — no need
-   to build it) and point `OMVLL_PYTHONPATH` at `Lib/`:
+   to build it). `fetch_deps.sh omvll` vendors it for you (the O-MVLL release
+   tarball bundles a version-matched `Python-3.10.7`), or fetch it standalone:
    ```sh
-   curl -LO https://www.python.org/ftp/python/3.10.7/Python-3.10.7.tgz
-   tar xzf Python-3.10.7.tgz
-   mv Python-3.10.7 third_party/python
+   ./third_party/fetch_deps.sh python     # -> third_party/python/ (pinned + SHA256)
    export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"
    ls "$OMVLL_PYTHONPATH/abc.py"      # sanity: must exist
    ```
@@ -198,10 +200,11 @@ a fresh terminal without them will fail.
 
 ### Configure and build
 
-The `OMVLL_PLUGIN` cache variable adds `-fpass-plugin` to every target (and, when
-set, `-Wl,-z,muldefs` — see fix for duplicate symbols below). Pass the plugin
-**only** this way; do **not** also inject `-fpass-plugin` via `CMAKE_CXX_FLAGS`,
-or it double-applies.
+`-DOMVLL=ON` fetches the pinned plugin (if absent) and adds `-fpass-plugin` to
+every target (plus `-Wl,-z,muldefs` — see fix for duplicate symbols below). To
+point at your own plugin build instead, set `-DOMVLL_PLUGIN="$PLUGIN"`. Pass the
+plugin **only** this way; do **not** also inject `-fpass-plugin` via
+`CMAKE_CXX_FLAGS`, or it double-applies.
 
 ```sh
 rm -rf build                          # wipe stale cache whenever toolchain/NDK/plugin change
@@ -210,7 +213,7 @@ cmake -GNinja -B build \
   -DANDROID_ABI=arm64-v8a \
   -DANDROID_PLATFORM=android-24 \
   -DCMAKE_BUILD_TYPE=Release \
-  -DOMVLL_PLUGIN="$PLUGIN"
+  -DOMVLL=ON
 cmake --build build -j
 ```
 
@@ -219,7 +222,7 @@ set. If the build crashes while *loading* the plugin, see
 [Troubleshooting O-MVLL](#troubleshooting-o-mvll).
 
 > **Targeting matters — see [OBFUSCATION.md](OBFUSCATION.md) and the template
-> `obfuscation/omvll_config.py`.** The config targets individual *functions* and
+> `third_party/omvll/omvll_config.py`.** The config targets individual *functions* and
 > excludes STL/libc++/EH-runtime symbols. An empty or module-wide config silently
 > obfuscates *everything* (including inlined STL), which overwhelms the backend —
 > see the two crash entries in troubleshooting.
@@ -251,7 +254,7 @@ clang you actually have** (a macOS/AppleClang- or matching upstream-clang build)
 Given such a plugin:
 
 ```sh
-export OMVLL_CONFIG="$PWD/obfuscation/omvll_config.py"
+export OMVLL_CONFIG="$PWD/third_party/omvll/omvll_config.py"
 export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"   # plugin's embedded CPython
 CXX=/path/to/matching/clang++  CC=/path/to/matching/clang  ZIG_BIN= \
 EXTRA_CXXFLAGS="-fpass-plugin=/path/to/host-OMVLL.dylib" \
@@ -261,9 +264,10 @@ EXTRA_CFLAGS="-fpass-plugin=/path/to/host-OMVLL.dylib" \
 
 or
 ```sh
+
 export PYTHONHOME="$(pyenv root)/versions/3.10.7"
 export NDK=/Users/tri.le/Library/Android/sdk/ndk/29.0.14206865
-export OMVLL_CONFIG="$PWD/obfuscation/omvll_config.py"
+export OMVLL_CONFIG="$PWD/third_party/omvll/omvll_config.py"
 export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"
 
 rm -rf build
@@ -271,10 +275,11 @@ cmake -GNinja -B build \
   -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
   -DCMAKE_BUILD_TYPE=Release \
-  -DOMVLL_PLUGIN=$PWD/obfuscation/omvll_ndk_r29.dylib
+  -DOMVLL_PLUGIN=$PWD/third_party/omvll/omvll_ndk_r29.dylib
 cmake --build build -j
 ```
 ```
+
 ```
 
 Set `ZIG_BIN=` empty (as above) so the zig toolchain doesn't shadow your `CXX`.
@@ -285,14 +290,14 @@ caveats:
 - **Don't add `-Wl,-z,muldefs` on macOS** — that's a GNU-ld/lld flag and Apple's
   `ld64` rejects it. You don't need it: the real fix for the duplicate
   `__clang_call_terminate` symbol is the `_is_library_fn` exclusion already in
-  `obfuscation/omvll_config.py`. Reserve `EXTRA_LDFLAGS="-Wl,-z,muldefs"` for
+  `third_party/omvll/omvll_config.py`. Reserve `EXTRA_LDFLAGS="-Wl,-z,muldefs"` for
   lld-based (NDK / Linux) links.
 - The freestanding `check:` gate still runs; the template config already disables
   the non-libc-safe passes (string encoding, anti-hooking) for `wb_stub` /
   `selftest`, so it should hold. If it trips, exclude the stub from the offending
   pass.
 
-If you only have the shipped r29 plugin, use the CMake + NDK path above instead —
+If you only have the pinned r29 plugin, use the CMake + NDK path above instead —
 that is the tested configuration.
 
 ### Verify the obfuscated build
@@ -300,7 +305,7 @@ that is the tested configuration.
 Obfuscation is semantics-preserving, so the correctness gate is the **host** test
 suite — run it via `build.sh` on the host (or a host CMake build), where all 8
 suites and the freestanding `check:` gate must still pass; a failure means a pass
-broke something (narrow the targeting in `obfuscation/omvll_config.py`).
+broke something (narrow the targeting in `third_party/omvll/omvll_config.py`).
 
 The Android `arm64-v8a` artifacts from the CMake/NDK path above were confirmed to
 **compile and link cleanly**, but they do not execute on the macOS host and the
@@ -341,7 +346,7 @@ instead of exporting them.)
 wrong path. Also do NOT name the config `omvll.py` — it shadows `import omvll`
 (you'd then see `module 'omvll' has no attribute '__file__'`). Use
 `omvll_config.py` (O-MVLL's default); the template in this repo is
-`obfuscation/omvll_config.py`.
+`third_party/omvll/omvll_config.py`.
 
 **`code signature … not valid … different Team IDs`, or "Signature does not
 match".** macOS hardened runtime is refusing to let the NDK clang load a
