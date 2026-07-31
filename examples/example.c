@@ -8,7 +8,7 @@
  * and calls only wbc_open / wbc_encrypt_* on a blob produced offline by the
  * provisioning tool (wb_keygen). The runtime libwbcrypto.so deliberately does
  * not export wbc_seal_key or the reference AES / white-box generator. See
- * docs/SDK.md and docs/BUILD.md.
+ * include/wbcrypto.h and docs/BUILD.md.
  */
 #include <stdio.h>
 #include <string.h>

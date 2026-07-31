@@ -4,6 +4,7 @@
 //  - interpreter binding: changing the opcode map breaks decode (can't re-map);
 //  - no stored keystream: decode derives from fw_root only; code looks random.
 #include <cmath>
+#include <utility>  // std::swap
 
 #include "test_util.h"
 #include "vm/assembler.h"

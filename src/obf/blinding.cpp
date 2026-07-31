@@ -1,5 +1,7 @@
 #include "obf/blinding.h"
 
+#include <utility>  // std::swap
+
 namespace obf {
 
 OpcodeBlinding BuildOpcodeBlinding(wbaes::Rng& rng, int op_count,

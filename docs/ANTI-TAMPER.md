@@ -18,12 +18,12 @@ existing floor; they do not create one — land the crypto/structure work first
 `third_party/omvll/omvll_config.py` targets the sensitive **functions** (never whole
 modules — that overwhelms the backend; see the file's header) in the hot TUs:
 `vm.cpp`, `handlers.cpp`, `assembler.cpp`, `trusted_storage.cpp`, `fwcrypt.cpp`,
-the SDK glue, and the freestanding stub. Enabled passes:
+and the SDK glue. Enabled passes:
 
 - control-flow flattening + bogus control flow (everywhere sensitive),
-- opaque/encrypted **constants** and **string encoding** on the shipped,
-  non-freestanding TUs — this is what removes the `WBTS` magic and the
-  SplitMix64/FNV constants from a `strings`/constant scan,
+- opaque/encrypted **constants** and **string encoding** on the sensitive TUs —
+  this is what removes the `WBTS` magic and the SplitMix64/FNV constants from a
+  `strings`/constant scan,
 - MBA arithmetic (heaviest — bring up last; dial back if the register coalescer
   crashes),
 - anti-hooking on the runtime/SDK TUs.

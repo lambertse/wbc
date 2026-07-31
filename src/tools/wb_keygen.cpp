@@ -14,7 +14,6 @@
 #include "storage/trusted_storage.h"
 #include "vm/assembler.h"
 #include "wbaes/aes_ref.h"
-#include "wbaes/wb_export.h"
 #include "wbaes/wb_generator.h"
 
 static bool ParseHex16(const std::string& s, wbaes::Key128& out) {
@@ -34,7 +33,7 @@ static bool ParseHex16(const std::string& s, wbaes::Key128& out) {
 }
 
 int main(int argc, char** argv) {
-    std::string key_hex, pass, out_path, table_path;
+    std::string key_hex, pass, out_path;
     uint64_t seed = 0xA5F00D;
     bool plain = false;
     for (int i = 1; i < argc; ++i) {
@@ -45,14 +44,13 @@ int main(int argc, char** argv) {
         else if (a == "--seed") seed = std::strtoull(next().c_str(), nullptr, 0);
         else if (a == "--plain") plain = true;
         else if (a == "--out") out_path = next();
-        else if (a == "--export-tables") table_path = next();
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
     wbaes::Key128 key{};
-    if (!ParseHex16(key_hex, key) || (out_path.empty() && table_path.empty())) {
+    if (!ParseHex16(key_hex, key) || out_path.empty()) {
         std::fprintf(stderr,
                      "usage: wb_keygen --key <32 hex> [--pass P] [--seed N] "
-                     "[--plain] [--out FILE] [--export-tables FILE]\n");
+                     "[--plain] --out FILE\n");
         return 2;
     }
 
@@ -72,15 +70,5 @@ int main(int argc, char** argv) {
                     prog.code.size());
     }
 
-    // Flat table image (for the freestanding device runtime, wb_stub.h).
-    if (!table_path.empty()) {
-        std::vector<uint8_t> img = wbaes::ExportTableImage(*wb);
-        std::ofstream f(table_path, std::ios::binary);
-        if (!f) { std::fprintf(stderr, "cannot write %s\n", table_path.c_str()); return 1; }
-        f.write(reinterpret_cast<const char*>(img.data()),
-                static_cast<std::streamsize>(img.size()));
-        std::printf("table image -> %s (%zu bytes, seed=%llu)\n", table_path.c_str(),
-                    img.size(), static_cast<unsigned long long>(seed));
-    }
     return 0;
 }

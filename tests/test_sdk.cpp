@@ -1,6 +1,8 @@
 // SDK C-ABI test: exercises wbcrypto.h end to end (seal -> open -> encrypt),
 // CTR round-trip, aliasing, and error paths. Included from C++ but uses only
 // the extern "C" surface a native integrator would see.
+#include <cstring>
+
 #include "test_util.h"
 #include "wbaes/aes_ref.h"   // oracle for cross-check
 #include "wbcrypto.h"

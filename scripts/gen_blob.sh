@@ -38,7 +38,7 @@ fi
 [ -n "$AR" ] || { echo "no archiver found (set HOST_AR)" >&2; exit 1; }
 echo "host compiler: $CXX    archiver: $AR"
 
-INCS=(-Isrc -Iinclude -Ifreestanding "-I$SODIUM_INC")
+INCS=(-Isrc -Iinclude "-I$SODIUM_INC")
 CXXFLAGS=(-std=c++17 -O2 "${INCS[@]}" -w)   # -w: this is a provisioning tool, not the shipped code
 
 mkdir -p "$BUILD"

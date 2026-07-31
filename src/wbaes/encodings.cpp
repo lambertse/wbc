@@ -1,5 +1,7 @@
 #include "encodings.h"
 
+#include <utility>  // std::swap
+
 namespace wbaes {
 
 Nibble IdentityNibble() {

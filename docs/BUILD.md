@@ -26,7 +26,7 @@ The build produces two library flavours; **only the runtime ships to devices**:
 | Library | Contents | Ships? |
 |---|---|---|
 | `libwbcrypto.{a,so}` | runtime only: open a sealed blob + encrypt (`wbc_open`, `wbc_encrypt_*`) + libsodium | **yes** |
-| `libwbprovision.a` | adds the keygen surface: reference AES, `GenerateWhiteBox`, assembler, `wbc_seal_key`, `wbc_export_tables` | **no** (build host only) |
+| `libwbprovision.a` | adds the keygen surface: reference AES, `GenerateWhiteBox`, assembler, `wbc_seal_key` | **no** (build host only) |
 
 The shared library is built with `-fvisibility=hidden` + a linker version script
 (`src/sdk/wbcrypto.map`) so it exports **only** `wbc_*`, and it is stripped
@@ -59,9 +59,9 @@ Outputs land in `./build/`:
 
 | Output               | Purpose                                             |
 |----------------------|-----------------------------------------------------|
-| `wb_keygen`          | seal an AES key into a blob; `--export-tables` for the device image |
+| `wb_keygen`          | seal an AES key into a blob                          |
 | `wb_encrypt`         | encrypt a block through a sealed blob               |
-| `libwbcrypto.a` / `.so` | the shipped C-ABI runtime SDK (see [SDK.md](SDK.md)) |
+| `libwbcrypto.a` / `.so` | the shipped C-ABI runtime SDK (see [../include/wbcrypto.h](../include/wbcrypto.h)) |
 | `libwbprovision.a`   | host-only provisioning lib (adds the keygen surface; not shipped) |
 | `libsodium.a`        | vendored crypto dependency (built once)             |
 | `example`            | C integration demo (full lifecycle → links `libwbprovision.a`) |
@@ -69,8 +69,7 @@ Outputs land in `./build/`:
 
 Source layout: `src/wbaes/` (white-box compiler), `src/vm/` (the VM),
 `src/fw/` (the context-keyed firmware toolchain), `src/obf/` (obfuscation
-primitives), `src/storage/` (trusted storage), `src/sdk/` (C ABI),
-`freestanding/` (the no-libc device runtime).
+primitives), `src/storage/` (trusted storage), `src/sdk/` (C ABI).
 
 ## Option B — CMake (standard toolchains)
 
@@ -88,8 +87,8 @@ This mirrors `build.sh`; the CLI tools appear as `build/wb_keygen` and
 You can additionally obfuscate the *native machine code* of the SDK/VM by loading
 an LLVM pass-plugin such as **[O-MVLL](https://obfuscator.re/omvll)** at compile
 time. This is complementary to the project's own bytecode/data obfuscation — see
-**[OBFUSCATION.md](OBFUSCATION.md)** for the rationale, what to target, and the
-freestanding caveat. This section covers just the build steps.
+**[ANTI-TAMPER.md](ANTI-TAMPER.md)** for the rationale and what to target. This
+section covers just the build steps.
 
 > **The tested path is an Android NDK cross-compile, driven by CMake + Ninja, on
 > a macOS (Apple Silicon) host.** O-MVLL only supports **AArch64 / AArch32**, so
@@ -221,7 +220,7 @@ Configure prints `native-code obfuscation: -fpass-plugin=…` when the plugin is
 set. If the build crashes while *loading* the plugin, see
 [Troubleshooting O-MVLL](#troubleshooting-o-mvll).
 
-> **Targeting matters — see [OBFUSCATION.md](OBFUSCATION.md) and the template
+> **Targeting matters — see [ANTI-TAMPER.md](ANTI-TAMPER.md) and the template
 > `third_party/omvll/omvll_config.py`.** The config targets individual *functions* and
 > excludes STL/libc++/EH-runtime symbols. An empty or module-wide config silently
 > obfuscates *everything* (including inlined STL), which overwhelms the backend —
@@ -292,10 +291,6 @@ caveats:
   `__clang_call_terminate` symbol is the `_is_library_fn` exclusion already in
   `third_party/omvll/omvll_config.py`. Reserve `EXTRA_LDFLAGS="-Wl,-z,muldefs"` for
   lld-based (NDK / Linux) links.
-- The freestanding `check:` gate still runs; the template config already disables
-  the non-libc-safe passes (string encoding, anti-hooking) for `wb_stub` /
-  `selftest`, so it should hold. If it trips, exclude the stub from the offending
-  pass.
 
 If you only have the pinned r29 plugin, use the CMake + NDK path above instead —
 that is the tested configuration.
@@ -303,14 +298,14 @@ that is the tested configuration.
 ### Verify the obfuscated build
 
 Obfuscation is semantics-preserving, so the correctness gate is the **host** test
-suite — run it via `build.sh` on the host (or a host CMake build), where all 8
-suites and the freestanding `check:` gate must still pass; a failure means a pass
-broke something (narrow the targeting in `third_party/omvll/omvll_config.py`).
+suite — run it via `build.sh` on the host (or a host CMake build), where all 7
+suites must still pass; a failure means a pass broke something (narrow the
+targeting in `third_party/omvll/omvll_config.py`).
 
 The Android `arm64-v8a` artifacts from the CMake/NDK path above were confirmed to
-**compile and link cleanly**, but they do not execute on the macOS host and the
-CMake path has no freestanding gate. **Functional verification of the obfuscated
-Android build requires an AArch64 device or emulator.** A quick static sanity
+**compile and link cleanly**, but they do not execute on the macOS host.
+**Functional verification of the obfuscated Android build requires an AArch64
+device or emulator.** A quick static sanity
 check that obfuscation did something: the obfuscated `libwbcrypto.so` should show
 a larger `.text` and flattened control flow in a disassembler.
 
@@ -424,7 +419,7 @@ warnings) and then caches it; subsequent builds are fast and quiet.
 
 ## Compiler flags
 
-`build.sh` compiles with `-std=c++17 -O2 -Isrc -Iinclude -Itests -Ifreestanding
+`build.sh` compiles with `-std=c++17 -O2 -Isrc -Iinclude -Itests
 -Wall -Wextra` (plus anything in `EXTRA_CXXFLAGS`/`EXTRA_CFLAGS`, see
 [Option C](#option-c--with-native-code-obfuscation-o-mvll)). The full build is a
 few seconds; there is no incremental object cache — every test binary is linked
@@ -437,20 +432,14 @@ dependency-free.
 ./build.sh test
 ```
 
-Expected output — a freestanding compile-gate plus eight passing suites:
+Expected output — seven passing suites:
 
 ```
-check: freestanding runtime (-ffreestanding -nostdlib -fno-builtin)
 [PASS] test_aes_ref     reference AES vs FIPS-197
 [PASS] test_wbaes       white-box == AES at each stratum (+ random keys)
 [PASS] test_vm          VM output == interpreter == AES (plain + hardened)
 [PASS] test_obf         MBA / opaque / opcode-blinding primitives
 [PASS] test_fw          context-keyed firmware: decode == AES, tamper cascade
 [PASS] test_sdk         C-ABI SDK: seal/open/ECB/CTR, error paths
-[PASS] test_stub        freestanding device runtime == AES (exported image)
 [PASS] test_e2e         seal→unseal→run, key-absence, anti-tamper
 ```
-
-The `check:` line is a build-time gate: it compiles the freestanding device
-runtime with `-ffreestanding -nostdlib -fno-builtin` and fails the build if any
-libc call (memcpy/memset/stack-protector) is emitted.

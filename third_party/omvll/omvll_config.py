@@ -1,14 +1,14 @@
 # omvll_config.py — TEMPLATE O-MVLL configuration for the White-box Crypto VM.
 #
 # O-MVLL (https://obfuscator.re/omvll) is an LLVM pass-plugin driven by this
-# Python file. It obfuscates the *native machine code* of the interpreter, SDK,
-# and freestanding runtime — the layer this project ships as plain compiled C++.
+# Python file. It obfuscates the *native machine code* of the interpreter and
+# SDK — the layer this project ships as plain compiled C++.
 #
 # ┌─ IMPORTANT ────────────────────────────────────────────────────────────────┐
 # │ The ObfuscationConfig API changes between O-MVLL releases. Treat this as a  │
 # │ STARTING POINT and align the method names / return types with the version  │
 # │ you installed (see the docs for your release). The targeting logic         │
-# │ (_sensitive / _is_freestanding) is what you'll actually tune.              │
+# │ (_sensitive) is what you'll actually tune.                                 │
 # │                                                                            │
 # │ HARD-WON LESSON: target individual FUNCTIONS, never whole modules. Gating  │
 # │ only on the module name obfuscates every function in the translation unit  │
@@ -27,9 +27,7 @@
 #   cmake --build build -j
 # (-DOMVLL=ON fetches the plugin + CPython stdlib; OMVLL_PYTHONPATH still needed.)
 #
-# See docs/BUILD.md (Option C) for the full setup and docs/OBFUSCATION.md for the
-# toolchain constraints and the freestanding caveat (some passes are NOT no-libc
-# safe).
+# See docs/BUILD.md (Option C) for the full setup and toolchain constraints.
 
 import omvll
 from functools import lru_cache
@@ -43,11 +41,7 @@ _SENSITIVE_MODULES = (
     "fwcrypt.cpp", "fw_schedule",                # the firmware decode schedule
     "trusted_storage.cpp",                       # sealing / KDF (holds WBTS magic)
     "wbcrypto.cpp", "wbcrypto_provision.cpp",    # SDK glue (runtime + provisioning)
-    "wb_stub", "selftest.c",                     # freestanding device runtime
 )
-# Modules that must stay libc-free: only CFG/arithmetic/opaque passes are safe
-# here — NO string encoding, NO anti-hooking (they emit decoder stubs / libc).
-_FREESTANDING_MODULES = ("wb_stub", "selftest.c")
 
 # HOT interpreter path — the fetch/decode/dispatch loop and handler bodies run
 # thousands of times per 16-byte block, so any heavy pass here multiplies by the
@@ -58,7 +52,7 @@ _FREESTANDING_MODULES = ("wb_stub", "selftest.c")
 # dynamic attacker who traces one block recovers it regardless. Obfuscate the
 # COLD code that gates a cheap offline attack (seal/unseal + loader in
 # trusted_storage.cpp, the assembler, the SDK glue) heavily instead. See the
-# "performance trap" in the Pass-2 O-MVLL addendum / docs/OBFUSCATION.md.
+# "performance trap" in the Pass-2 O-MVLL addendum / docs/ANTI-TAMPER.md.
 _HOT_MODULES = ("vm.cpp", "handlers.cpp")
 
 # COLD gate TUs where MBA (arithmetic obfuscation) is worth its cost. These run
@@ -103,23 +97,12 @@ def _sensitive(mod, func):
     n = _mod_name(mod)
     return any(s in n for s in _SENSITIVE_MODULES)
 
-def _is_freestanding(mod, _func):
-    n = _mod_name(mod)
-    return any(s in n for s in _FREESTANDING_MODULES)
-
-def _sensitive_nonfree(mod, func):
-    # Sensitive AND not a no-libc module — the set that may receive the passes
-    # that emit decoder stubs / libc calls (string & constant encryption).
-    return _sensitive(mod, func) and not _is_freestanding(mod, func)
-
 
 # --- Config ------------------------------------------------------------------
 # Bring passes up GRADUALLY, not all at once. A known-stable starting point is
 # break_control_flow + flatten_functions only. obfuscate_arithmetic (MBA) is the
 # heaviest and the most likely to reintroduce a backend crash at -O2/-O3 — enable
-# it last, on the smallest function set. String encoding and anti-hooking are NOT
-# freestanding-safe (they emit decoder stubs / libc calls); keep them off for the
-# wb_stub / selftest.c freestanding modules.
+# it last, on the smallest function set.
 class Config(omvll.ObfuscationConfig):
     def __init__(self):
         super().__init__()
@@ -147,23 +130,23 @@ class Config(omvll.ObfuscationConfig):
 
     # Opaque / encrypted constants — hides the WBTS seal magic, the SplitMix64 /
     # FNV constants, and S-box references so they are not recoverable by a
-    # constant scan. Not freestanding-safe (decoder), so host/runtime only; and
-    # excluded from the hot path (per-op constant materialization is costly).
+    # constant scan. Excluded from the hot path (per-op constant materialization
+    # is costly).
     def obfuscate_constants(self, mod, func):
-        return _sensitive_nonfree(mod, func) and not _is_hot(mod)
+        return _sensitive(mod, func) and not _is_hot(mod)
 
     # Opaque struct-field access — excluded from the hot path: the dispatch loop
     # touches VMContext fields every op, so obfuscating that access is per-op.
     def obfuscate_struct_access(self, mod, func, struct):
         return _sensitive(mod, func) and not _is_hot(mod)
 
-    # String encoding — NOT freestanding-safe (adds a decoder stub). Encrypts
-    # string literals in the sensitive host/runtime TUs (e.g. the "WBTS" magic in
-    # trusted_storage.cpp) so `strings` does not reveal them. A bare `True`
-    # enables encoding (O-MVLL default); return omvll.StringEncOptLocal() instead
-    # for in-function decode (stronger vs memory dumps) on the most sensitive TUs.
+    # String encoding — encrypts string literals in the sensitive host/runtime
+    # TUs (e.g. the "WBTS" magic in trusted_storage.cpp) so `strings` does not
+    # reveal them. A bare `True` enables encoding (O-MVLL default); return
+    # omvll.StringEncOptLocal() instead for in-function decode (stronger vs
+    # memory dumps) on the most sensitive TUs.
     def obfuscate_string(self, mod, func, string):
-        return _sensitive_nonfree(mod, func) and not _is_hot(mod)
+        return _sensitive(mod, func) and not _is_hot(mod)
 
     # Anti-hooking — OFF. It conflicts with control-flow flattening: CFF clones
     # functions (the `foo (.3)` / `foo.25` suffixes), and the anti-hook pass then

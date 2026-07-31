@@ -12,7 +12,6 @@ framing. This document assumes you're comfortable reading C++ and want to know
 - [5. Layer 3 — Context-keyed firmware](#5-layer-3--context-keyed-firmware)
 - [6. Layer 4 — Trusted storage](#6-layer-4--trusted-storage)
 - [7. Layer 5 — The C-ABI SDK](#7-layer-5--the-c-abi-sdk)
-- [8. Layer 6 — Freestanding device runtime](#8-layer-6--freestanding-device-runtime)
 - [9. End-to-end data flow](#9-end-to-end-data-flow)
 - [10. Key data structures](#10-key-data-structures)
 - [11. Sizes and numbers](#11-sizes-and-numbers)
@@ -23,8 +22,7 @@ framing. This document assumes you're comfortable reading C++ and want to know
 
 ## 1. Component map
 
-~2,350 lines of dependency-free C++17 (plus one freestanding C header). Each
-directory is one responsibility:
+~2,350 lines of dependency-free C++17. Each directory is one responsibility:
 
 | Path | Responsibility |
 |------|----------------|
@@ -35,9 +33,8 @@ directory is one responsibility:
 | `src/storage/` | **Trusted storage**: serialize + seal a program into an at-rest blob with integrity binding. |
 | `src/sdk/` | The **C ABI** (`libwbcrypto`): a thin, exception-safe wrapper over the C++ core. |
 | `src/tools/` | The CLIs `wb_keygen` and `wb_encrypt`. |
-| `freestanding/` | The **no-libc device runtime** (`wb_stub.h`) + the shared table-image layout + a compile-only self-check. |
 | `include/wbcrypto.h` | The public SDK header. |
-| `tests/` | Eight test suites (correctness, differential, tamper, freestanding). |
+| `tests/` | Seven test suites (correctness, differential, tamper). |
 
 ---
 
@@ -53,8 +50,6 @@ directory is one responsibility:
       │                                │                                  │
       │                                │                                  └─► Seal ──► sealed blob (bytes)
       │                                │                                         src/storage/
-      │                                └─► ExportTableImage ──► flat table image (freestanding)
-      │                                       src/wbaes/wb_export
       │
       └─► (reference AES oracle, src/wbaes/aes_ref, only used by tests)
 
@@ -62,9 +57,8 @@ directory is one responsibility:
                                        src/vm/
 ```
 
-Two distinct execution targets share the same tables:
-- the **VM path** (host / SDK / CLI) runs the encrypted bytecode in the interpreter;
-- the **freestanding path** (device stub) runs the exported tables directly.
+The **VM path** (host / SDK / CLI) runs the encrypted bytecode in the
+interpreter.
 
 ---
 
@@ -121,7 +115,8 @@ Two build levels (`WBLevel`):
 deliberate choice: it makes the white-box a **drop-in AES-128** whose output
 equals the FIPS vector directly. (A stronger "mixing bijection" level was
 evaluated and deliberately deferred — see [§13](#13-design-decisions--rationale)
-and [THREATMODEL.md](THREATMODEL.md).)
+and the README's
+[Threat model & honest limitations](../README.md#threat-model--honest-limitations).)
 
 ### 3.4 Building and evaluating
 
@@ -331,7 +326,6 @@ Surface:
 
 ```
 wbc_seal_key(key, pass, seed, hardened, &blob, &len)   # offline: key → sealed blob
-wbc_export_tables(key, seed, &image, &len)             # offline: key → freestanding image
 wbc_open(blob, len, pass, &ctx)                        # runtime: load a blob
 wbc_encrypt_block(ctx, in16, out16)                    # one ECB block
 wbc_encrypt_ecb(ctx, in, out, len)                     # many ECB blocks
@@ -346,28 +340,6 @@ use needs. Ships as `libwbcrypto.a` and `libwbcrypto.so`.
 
 ---
 
-## 8. Layer 6 — Freestanding device runtime
-
-**Goal:** decrypt on a device with **no libc, no malloc, no dynamic loader** —
-e.g. an injected packer stub — where the C++ SDK cannot run.
-
-- `freestanding/wb_table_layout.h` — the flat **table-image** format (a 12-byte
-  header + the T-box/Tyi/XOR regions, `WBTB_IMAGE_SIZE == 409612`). Shared with
-  the host exporter `src/wbaes/wb_export.cpp` (`ExportTableImage`).
-- `freestanding/wb_stub.h` — header-only `wbstub_encrypt_block` and
-  `wbstub_ctr_xcrypt`. Pure C, no libc, no allocation, **no function pointers**
-  (relocation-free), small fixed stack arrays only. It runs the *same table
-  network* as `wb_interp`, read straight from the image.
-
-Crucially the device path runs the **tables directly** — it does **not** include
-the VM, the bytecode, or the context-keyed firmware (those need mutable memory
-and a full runtime). So on device you get *key diffusion* but not the VM/firmware
-static-hardening. A build gate (`freestanding/selftest.c` + `build.sh`) compiles
-the runtime with `-ffreestanding -nostdlib -fno-builtin` and **fails if any libc
-call is emitted**.
-
----
-
 ## 9. End-to-end data flow
 
 ### Offline (key known, on a trusted host)
@@ -377,8 +349,6 @@ key ─► GenerateWhiteBox ─► WhiteBox ─► AssembleWhiteBox ─► (plai
                                           │                  + DATA image + spans/junk)
                                           ▼
                                      EncryptFirmware ─► vm::Program ─► Seal ─► blob
-                                          │
-                       (or) ExportTableImage ─► lib.wbt  (for the freestanding stub)
 ```
 
 ### Runtime — VM path (host / SDK / CLI)
@@ -392,13 +362,6 @@ blob ─► Unseal ─► vm::Program ─► Run:
           │                          evolve key_reg
           ▼
       ciphertext == standard AES-128
-```
-
-### Runtime — freestanding path (device stub)
-
-```
-lib.wbt ─► wbstub_ctr_xcrypt(tables, iv, buf, buf, len) ─► decrypted payload
-           (direct table lookups + XOR; no VM, no firmware)
 ```
 
 ---
@@ -426,7 +389,6 @@ lib.wbt ─► wbstub_ctr_xcrypt(tables, iv, buf, buf, len) ─► decrypted pay
 | Registers / opcodes | 16 × 32-bit / 19 |
 | White-box tables (in memory) | ~1.5 MB (`WhiteBox`) |
 | VM DATA image | 409,648 B (tables + 3×16 B scratch) |
-| Freestanding table image | 409,612 B (`WBTB_IMAGE_SIZE`) |
 | Hardened bytecode | ~58 KB, entropy ≈ 7.997 bits/byte |
 | Sealed blob (hardened) | ~468 KB |
 | FIPS-197 anchor | key `000102…0f`, pt `001122…ff` → ct `69c4e0d8…c55a` |
@@ -448,8 +410,6 @@ random keys/blocks:
   opcode-blinding disjointness (each primitive proven before it's used).
 - `test_fw` — context decode == AES; **byte-tamper cascade**; **interpreter
   binding**; high entropy; no stored keystream.
-- `test_stub` — the freestanding runtime == AES from an exported image (+ CTR
-  round-trip); plus a compile-time no-libc gate.
 - `test_e2e` — seal→unseal→run == AES; **key absence** (no key/round-key bytes in
   the blob or decrypted tables); **anti-tamper** (code-byte flip / wrong
   passphrase → wrong output, and the integrity binding is shown to have fired).
@@ -474,13 +434,15 @@ random keys/blocks:
 - **32-bit mixing bijections deliberately *not* implemented** → a version that
   cancels within a round adds no BGE resistance (and the `==AES` test can't even
   tell), and a faithful version is exactly what BGE was built to break — real
-  complexity for a bounded, unverifiable, still-breakable margin. Documented as
-  future work in [THREATMODEL.md](THREATMODEL.md) instead.
+  complexity for a bounded, unverifiable, still-breakable margin. Listed under
+  the README's
+  [Deferred / future work](../README.md#threat-model--honest-limitations) instead.
 - **No third-party dependencies**; builds with a bootstrapped `zig c++` toolchain
   when no system compiler exists (see [BUILD.md](BUILD.md)).
 
 ---
 
-*For what all of this does and does **not** protect against, read
-[THREATMODEL.md](THREATMODEL.md). For the source material (Tim Blazytko's
-obfuscation/deobfuscation deck) see `assets/tim-slide.pdf`.*
+*For what all of this does and does **not** protect against, read the README's
+[Threat model & honest limitations](../README.md#threat-model--honest-limitations).
+For the source material (Tim Blazytko's obfuscation/deobfuscation deck) see
+`assets/tim-slide.pdf`.*

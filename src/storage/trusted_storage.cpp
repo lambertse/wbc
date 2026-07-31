@@ -2,6 +2,7 @@
 
 #include <sodium.h>
 
+#include <algorithm>
 #include <cstring>
 #include <new>
 #include <stdexcept>

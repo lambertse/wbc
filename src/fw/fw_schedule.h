@@ -46,7 +46,7 @@ inline uint64_t UpdateKeyReg(uint64_t key_reg, uint32_t fold, uint32_t ip) {
 // The interpreter fingerprint hashes this together with the live opcode map, so
 // re-mapping opcodes or patching this table changes `root` and breaks decode.
 // (Binding to actual handler machine code is possible but platform-specific;
-//  documented as future work in docs/THREATMODEL.md.)
+//  documented as future work in the project README's threat-model section.)
 inline constexpr std::array<uint8_t, vm::kOpCount> kInterpFingerprint = {
     0x3B, 0x9A, 0xC4, 0x17, 0x52, 0xE8, 0x0D, 0x71, 0xBF, 0x2A,
     0x66, 0xD3, 0x48, 0x95, 0xFC, 0x81, 0x2E, 0x57, 0xA9,

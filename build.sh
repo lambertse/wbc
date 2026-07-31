@@ -69,14 +69,14 @@ fi
 # visibility("default") in wbcrypto.h) and, via the version script below, the
 # public surface end up exported. -ffunction/data-sections lets --gc-sections
 # drop dead code from the shipped .so.
-INCS=(-Isrc -Iinclude -Itests -Ifreestanding "-I$SODIUM_INC")
+INCS=(-Isrc -Iinclude -Itests "-I$SODIUM_INC")
 CXXFLAGS=(-std=c++17 -O2 "${INCS[@]}" -Wall -Wextra -Wno-nullability-completeness
           -fvisibility=hidden -fvisibility-inlines-hidden
           -ffunction-sections -fdata-sections)
 
 # Opt-in native-code obfuscation hook. Append extra compiler flags (e.g. an
 # LLVM pass-plugin like O-MVLL: EXTRA_CXXFLAGS="-fpass-plugin=/path/OMVLL.so").
-# Empty by default, so normal builds are unaffected. See docs/OBFUSCATION.md.
+# Empty by default, so normal builds are unaffected. See docs/BUILD.md.
 #   EXTRA_CXXFLAGS  — appended to every C++ compile
 #   EXTRA_CFLAGS    — appended to the C example compile
 #   EXTRA_LDFLAGS   — appended to every link (e.g. -Wl,-z,muldefs, which
@@ -116,7 +116,6 @@ RUNTIME_SRCS=(
 PROVISION_SRCS=(
     src/wbaes/gf256.cpp src/wbaes/aes_ref.cpp src/wbaes/aes_tables.cpp
     src/wbaes/encodings.cpp src/wbaes/wb_generator.cpp src/wbaes/wb_interp.cpp
-    src/wbaes/wb_export.cpp
     src/vm/assembler.cpp
     src/fw/fwcrypt.cpp
     src/obf/blinding.cpp
@@ -212,22 +211,6 @@ if [ ${#ARCMD[@]} -ne 0 ]; then
     fi
 else
     echo "WARN: no archiver found; skipping static/shared library build" >&2
-fi
-
-# ---- freestanding device-runtime self-check --------------------------------
-# The device stub runtime (freestanding/wb_stub.h) must compile with no libc and
-# must not emit compiler-inserted libc calls (memcpy/memset/stack-protector).
-if [ -f freestanding/selftest.c ]; then
-    echo "check: freestanding runtime (-ffreestanding -nostdlib -fno-builtin)"
-    "${CCCMD[@]}" -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
-        -Ifreestanding -O2 -S freestanding/selftest.c -o "$BUILD/wb_stub.s"
-    if grep -Eq 'memcpy|memset|memmove|__stack_chk' "$BUILD/wb_stub.s"; then
-        echo "ERROR: freestanding runtime references libc:" >&2
-        grep -E 'memcpy|memset|memmove|__stack_chk' "$BUILD/wb_stub.s" >&2
-        exit 1
-    fi
-    "${CCCMD[@]}" -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
-        -Ifreestanding -O2 -c freestanding/selftest.c -o "$BUILD/wb_stub.o"
 fi
 
 # ---- run tests -------------------------------------------------------------

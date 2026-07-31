@@ -42,7 +42,7 @@ function(fetch_dep target)
   endif()
 endfunction()
 
-# Opt-in native-code obfuscation (see docs/OBFUSCATION.md and docs/BUILD.md).
+# Opt-in native-code obfuscation (see docs/BUILD.md).
 # -DOMVLL=ON fetches the pinned O-MVLL plugin (+ its matching CPython 3.10 stdlib)
 # into third_party/ and wires -fpass-plugin automatically. The fully tested path
 # is an Android NDK cross-compile; the plugin, third_party/omvll/
@@ -118,7 +118,6 @@ set(PROVISION_SOURCES
   ${CMAKE_SOURCE_DIR}/src/wbaes/encodings.cpp
   ${CMAKE_SOURCE_DIR}/src/wbaes/wb_generator.cpp
   ${CMAKE_SOURCE_DIR}/src/wbaes/wb_interp.cpp
-  ${CMAKE_SOURCE_DIR}/src/wbaes/wb_export.cpp
   ${CMAKE_SOURCE_DIR}/src/vm/assembler.cpp
   ${CMAKE_SOURCE_DIR}/src/fw/fwcrypt.cpp
   ${CMAKE_SOURCE_DIR}/src/obf/blinding.cpp
@@ -127,7 +126,6 @@ set(PROVISION_SOURCES
 set(WBVM_INCLUDES
   ${CMAKE_SOURCE_DIR}/src
   ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/freestanding
   ${SODIUM_INC})
 
 add_library(wbvm_runtime_obj OBJECT ${RUNTIME_SOURCES})

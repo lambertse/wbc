@@ -4,6 +4,8 @@
 //     sealed blob or the (unsealed) table bank — it is diffused, never stored;
 //  3. anti-tamper: flipping any blob byte, or a wrong passphrase, fails AEAD
 //     authentication so the blob does not unseal (no correct-key leak).
+#include <cstring>
+
 #include "test_util.h"
 #include "storage/trusted_storage.h"
 #include "vm/assembler.h"

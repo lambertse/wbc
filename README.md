@@ -24,9 +24,7 @@ hardened with the obfuscation techniques from Tim Blazytko's
 no-prerequisites explanation, then **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 for the full component-by-component implementation. All docs:
 [OVERVIEW](docs/OVERVIEW.md) · [ARCHITECTURE](docs/ARCHITECTURE.md) ·
-[BUILD](docs/BUILD.md) · [USAGE](docs/USAGE.md) · [SDK](docs/SDK.md) ·
-[INTEGRATION](docs/INTEGRATION-native-lib-encryption.md) ·
-[OBFUSCATION](docs/OBFUSCATION.md) · [THREATMODEL](docs/THREATMODEL.md).
+[BUILD](docs/BUILD.md) · [ANTI-TAMPER](docs/ANTI-TAMPER.md).
 
 ## What it does
 
@@ -43,7 +41,7 @@ for the full component-by-component implementation. All docs:
   patching **any** code byte, or re-mapping opcodes, cascades into garbage
   (runtime anti-tamper); and there is no single keystream to lift statically.
   (Honest ceiling: this hardens *static analysis and tampering*, not dynamic
-  tracing — see [docs/THREATMODEL.md](docs/THREATMODEL.md).)
+  tracing — see [Threat model & honest limitations](#threat-model--honest-limitations).)
 * **Phase 2 — trusted storage.** The compiled program is sealed at rest with a
   vetted AEAD: the table bank is encrypted with XChaCha20-Poly1305 under a key
   derived from the passphrase by Argon2id (memory-hard, random per-blob salt),
@@ -80,9 +78,8 @@ math — which is why the VM ISA is tiny.
 
 ## Build & run
 
-> Detailed guides: **[docs/BUILD.md](docs/BUILD.md)**, **[docs/USAGE.md](docs/USAGE.md)**
-> (CLI), **[docs/SDK.md](docs/SDK.md)** (C library / FFI), and
-> **[docs/INTEGRATION-native-lib-encryption.md](docs/INTEGRATION-native-lib-encryption.md)**.
+> Detailed guides: **[docs/BUILD.md](docs/BUILD.md)** (build & CLI) and the C ABI
+> header **[include/wbcrypto.h](include/wbcrypto.h)** (C library / FFI).
 >
 > The project builds three ways from one core: the **CLI tools**
 > (`wb_keygen`/`wb_encrypt`), a **C-ABI SDK** (`libwbcrypto.a` / `libwbcrypto.so`
@@ -137,14 +134,13 @@ A `CMakeLists.txt` is also provided for standard toolchains (mirrors the script;
 
 ## Threat model & honest limitations
 
-This is a faithful, working artifact — not an unbreakable key vault. **See
-[docs/THREATMODEL.md](docs/THREATMODEL.md) for the full layer-by-layer analysis
-and attacker model.** In short:
+This is a faithful, working artifact — not an unbreakable key vault. The
+layer-by-layer picture:
 
 * **Chow's white-box AES is academically broken.** The BGE / Billet et al.
   attacks extract the key from the tables regardless of how clean the VM is
-  (internal-encoding level; no 32-bit mixing bijections — see the doc for why
-  those were deliberately deferred rather than added). The value is that the key
+  (internal-encoding level; no 32-bit mixing bijections — see the deferred-work
+  note below for why those were left out rather than added). The value is that the key
   is never a contiguous byte string and never materializes at runtime.
 * **The VM + context-keyed firmware protect *static analysis and tampering*, not
   the key and not dynamic analysis.** Opcode blinding, MBA, opaque predicates and
@@ -157,6 +153,6 @@ and attacker model.** In short:
   binary has the passphrase, so durable protection needs hardware-backed device
   binding (`src/rt/device_binding.*`, roadmap).
 
-Deferred / future work (with rationale in the threat model): 32-bit mixing
-bijections, dynamic-analysis hardening (anti-debug, data-dependent control flow),
-space-hard constructions, and a real KDF/AEAD for the at-rest seal.
+Deferred / future work: 32-bit mixing bijections, dynamic-analysis hardening
+(anti-debug, data-dependent control flow), space-hard constructions, and
+hardware-backed device binding for the at-rest seal.

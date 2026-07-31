@@ -95,9 +95,8 @@ never *read the key*.
 
 | You want to…                                  | Use                               |
 |-----------------------------------------------|-----------------------------------|
-| Seal a key and encrypt from the command line  | `wb_keygen` / `wb_encrypt` ([USAGE.md](USAGE.md)) |
-| Embed it in a C/C++/JNI/Rust/Go app           | the C library `libwbcrypto` ([SDK.md](SDK.md)) |
-| Run it in a tiny no-libc environment (a packer stub) | the freestanding runtime `wb_stub.h` ([INTEGRATION-native-lib-encryption.md](INTEGRATION-native-lib-encryption.md)) |
+| Seal a key and encrypt from the command line  | `wb_keygen` / `wb_encrypt` ([BUILD.md](BUILD.md)) |
+| Embed it in a C/C++/JNI/Rust/Go app           | the C library `libwbcrypto` ([../include/wbcrypto.h](../include/wbcrypto.h)) |
 | Build everything                              | `./build.sh` ([BUILD.md](BUILD.md)) |
 
 A useful sanity check: because the scheme is arranged to be **drop-in AES-128**,
@@ -108,7 +107,8 @@ computed, never *what* it computes.
 ## 6. Honest limits (please read)
 
 This raises the **practical** bar; it is **not** an unbreakable vault. Two hard
-truths, expanded in [THREATMODEL.md](THREATMODEL.md):
+truths, expanded in the README's
+[Threat model & honest limitations](../README.md#threat-model--honest-limitations):
 
 - **The key is not cryptographically secret.** Chow's white-box is academically
   broken (the "BGE attack"): a determined cryptanalyst can extract the key from
@@ -131,12 +131,12 @@ decryptor" both fail — it's a solid, faithful implementation.
 - **Bytecode** — the fake-CPU program the VM executes.
 - **Firmware (here)** — the (encrypted) bytecode image loaded into the VM.
 - **Blob** — the sealed file holding the encrypted firmware + tables.
-- **Freestanding** — code that runs with no operating system / no C standard library.
 - **BGE attack** — the known cryptanalytic attack that extracts keys from Chow white-boxes.
 
 ## 8. Where to next
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — every component, data structure, and algorithm, with file references.
-- **[BUILD.md](BUILD.md)** — how to compile and test.
-- **[USAGE.md](USAGE.md)** / **[SDK.md](SDK.md)** — CLI and library usage.
-- **[THREATMODEL.md](THREATMODEL.md)** — what each layer does and does not protect.
+- **[BUILD.md](BUILD.md)** — how to compile, test, and drive the CLI tools.
+- **[../include/wbcrypto.h](../include/wbcrypto.h)** — the C ABI for embedding the library.
+- **[ANTI-TAMPER.md](ANTI-TAMPER.md)** — the native-code obfuscation (O-MVLL) hardening.
+- **[Threat model](../README.md#threat-model--honest-limitations)** — what each layer does and does not protect.

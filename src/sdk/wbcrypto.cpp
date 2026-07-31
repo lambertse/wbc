@@ -2,8 +2,8 @@
 //
 // This translation unit is the one that SHIPS in libwbcrypto.{a,so}. It must
 // contain only the field-side runtime: open a sealed blob and encrypt. The
-// key-generation surface (wbc_seal_key / wbc_export_tables, which pull in the
-// reference AES, the white-box generator, and the assembler) lives in the
+// key-generation surface (wbc_seal_key, which pulls in the reference AES, the
+// white-box generator, and the assembler) lives in the
 // separate wbcrypto_provision.cpp so that code never ships alongside the thing
 // that must not reveal the key. See docs/BUILD.md (runtime vs provisioning).
 //
@@ -37,9 +37,9 @@ const char* wbc_strerror(wbc_status s) {
     return "unknown";
 }
 
-/* wbc_seal_key and wbc_export_tables are the key-generation surface; they live
- * in wbcrypto_provision.cpp (provisioning build) and are deliberately NOT part
- * of the shipped runtime library. */
+/* wbc_seal_key is the key-generation surface; it lives in
+ * wbcrypto_provision.cpp (provisioning build) and is deliberately NOT part of
+ * the shipped runtime library. */
 
 wbc_status wbc_open(const uint8_t* blob, size_t blob_len, const char* passphrase,
                     wbc_ctx** out_ctx) {

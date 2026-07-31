@@ -10,7 +10,8 @@
 //
 // This replaces an earlier home-rolled construction (SplitMix64 XOR keystream +
 // unkeyed FNV integrity tag) which had no KDF, no per-blob salt/nonce, and a
-// forgeable tag. See docs/THREATMODEL.md. In the white-box threat model an
+// forgeable tag. See the project README's threat-model section. In the
+// white-box threat model an
 // attacker who runs the field binary has the passphrase, so the seal's role is
 // to protect the blob AT REST and raise the offline-extraction bar; its durable
 // value comes with hardware-backed key binding (docs, P2.4).

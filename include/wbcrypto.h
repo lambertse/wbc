@@ -66,15 +66,6 @@ WBC_API wbc_status wbc_seal_key(const uint8_t key[WBC_KEY_BYTES],
                                 uint8_t** out_blob,
                                 size_t* out_len);
 
-/* Export the white-box as a flat table image for the FREESTANDING device
- * runtime (freestanding/wb_stub.h) — no VM bytecode, no passphrase, just the
- * diffused-key table network. Use this to embed a decryptor into a no-libc stub
- * (e.g. native-lib-encryption's stub/). *out_image is malloc'd (wbc_free it).
- * `seed` must match what the runtime side expects (it selects the encodings). */
-WBC_API wbc_status wbc_export_tables(const uint8_t key[WBC_KEY_BYTES],
-                                     uint64_t seed,
-                                     uint8_t** out_image, size_t* out_len);
-
 /* ---- Runtime: open a blob and encrypt ------------------------------------ */
 /* Open a sealed blob (as produced by wbc_seal_key or the wb_keygen CLI).
  * The blob is authenticated (AEAD): a wrong passphrase or a tampered blob
