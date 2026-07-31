@@ -29,11 +29,24 @@ set(WBC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH "SDK root")
 set(WBC_INCLUDE_DIR "${WBC_ROOT}/include" CACHE PATH "dir containing wbcrypto.h")
 set(WBC_LIB_DIR     "${WBC_ROOT}/build"   CACHE PATH "dir containing libwbcrypto")
 
+# Static linking bakes libwbcrypto.a (which already bundles libsodium) into
+# field_app, so there is no runtime .so/.dylib to locate — no rpath, no install
+# name, no loader lookup. Prefer the static archive so find_library resolves
+# libwbcrypto.a instead of the shared lib (which it prefers by default).
+option(WBC_STATIC "Link libwbcrypto statically (.a) — self-contained binary" ON)
+if(WBC_STATIC)
+  set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+endif()
+
 find_path(WBC_HEADER wbcrypto.h HINTS "${WBC_INCLUDE_DIR}" REQUIRED)
 find_library(WBC_LIB NAMES wbcrypto libwbcrypto HINTS "${WBC_LIB_DIR}" REQUIRED)
 
 message(STATUS "wbcrypto.h : ${WBC_HEADER}/wbcrypto.h")
-message(STATUS "libwbcrypto: ${WBC_LIB}")
+if(WBC_STATIC)
+  message(STATUS "libwbcrypto: ${WBC_LIB}  (static)")
+else()
+  message(STATUS "libwbcrypto: ${WBC_LIB}  (shared)")
+endif()
 
 # --- The field app ----------------------------------------------------------
 add_executable(field_app field_app.cpp)
@@ -43,10 +56,18 @@ target_link_libraries(field_app PRIVATE "${WBC_LIB}")
 # Passphrase compiled into the binary (matches the bundled sealed.blob).
 target_compile_definitions(field_app PRIVATE WBC_APP_PASSPHRASE="demo")
 
-# Find the shared lib at runtime without LD_LIBRARY_PATH.
-set_target_properties(field_app PROPERTIES
-    BUILD_RPATH   "${WBC_LIB_DIR}"
-    INSTALL_RPATH "${WBC_LIB_DIR}")
+if(WBC_STATIC)
+  # libsodium (vendored into the archive) uses pthreads on some platforms; the
+  # static link must pull them in itself (a shared .so would list them as NEEDED).
+  # Threads::Threads is a no-op where the C library already provides them (macOS).
+  find_package(Threads REQUIRED)
+  target_link_libraries(field_app PRIVATE Threads::Threads)
+else()
+  # Shared lib only: give the loader a runtime search path (no LD_LIBRARY_PATH).
+  set_target_properties(field_app PROPERTIES
+      BUILD_RPATH   "${WBC_LIB_DIR}"
+      INSTALL_RPATH "${WBC_LIB_DIR}")
+endif()
 
 # Put the sealed blob next to the executable so `./build/field_app` just works.
 add_custom_command(TARGET field_app POST_BUILD
