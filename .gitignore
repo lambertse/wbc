@@ -1,3 +1,8 @@
 /build/
 *.o
 *.blob
+.DS_Store
+# Vendored dependency source (populated by scripts/fetch_libsodium.sh).
+third_party/libsodium/
+third_party/python/
+/build-host/

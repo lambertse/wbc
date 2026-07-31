@@ -1,13 +1,38 @@
 # Build Guide
 
-The White-box Crypto VM is a C++17 project with **no third-party dependencies**.
-It builds two ways: a self-contained `build.sh` (the tested path) and a portable
-`CMakeLists.txt` for standard toolchains.
+The White-box Crypto VM is a C++17 project. Its only third-party dependency is
+**libsodium** (the seal's Argon2id KDF + XChaCha20-Poly1305 AEAD), vendored from
+source. It builds two ways: a self-contained `build.sh` (the tested path) and a
+portable `CMakeLists.txt` for standard toolchains.
 
 ## Requirements
 
 - A **C++17 compiler** (`clang++` 8+, `g++` 9+, or `zig c++`).
-- That's it — no crypto libraries, no test framework, no external headers.
+- **libsodium source**, fetched once with a pinned version + SHA256:
+
+  ```sh
+  ./scripts/fetch_libsodium.sh          # populates third_party/libsodium/ (not committed)
+  ```
+
+  The build compiles libsodium from source (no autotools/`configure` needed —
+  portable C is selected automatically), so no system crypto library is
+  required. Both `build.sh` and CMake error out with this hint if it is missing.
+
+## Runtime vs provisioning (what ships)
+
+The build produces two library flavours; **only the runtime ships to devices**:
+
+| Library | Contents | Ships? |
+|---|---|---|
+| `libwbcrypto.{a,so}` | runtime only: open a sealed blob + encrypt (`wbc_open`, `wbc_encrypt_*`) + libsodium | **yes** |
+| `libwbprovision.a` | adds the keygen surface: reference AES, `GenerateWhiteBox`, assembler, `wbc_seal_key`, `wbc_export_tables` | **no** (build host only) |
+
+The shared library is built with `-fvisibility=hidden` + a linker version script
+(`src/sdk/wbcrypto.map`) so it exports **only** `wbc_*`, and it is stripped
+(`-Wl,--strip-all`, no build-id) so it ships no symbol table or DWARF. On the NDK
+path an extra `llvm-strip --remove-section=.comment` post-link step reaches the
+shipped `.so` (the NDK toolchain otherwise injects `-g`). Verify with
+`readelf --dyn-syms` (only `wbc_*`) and `nm` (no `GenerateWhiteBox`/`AesEncrypt*`).
 
 ## Option A — `build.sh` (recommended, no CMake needed)
 
@@ -35,8 +60,10 @@ Outputs land in `./build/`:
 |----------------------|-----------------------------------------------------|
 | `wb_keygen`          | seal an AES key into a blob; `--export-tables` for the device image |
 | `wb_encrypt`         | encrypt a block through a sealed blob               |
-| `libwbcrypto.a` / `.so` | the C-ABI SDK (see [SDK.md](SDK.md))             |
-| `example`            | C integration demo linking `libwbcrypto.so`         |
+| `libwbcrypto.a` / `.so` | the shipped C-ABI runtime SDK (see [SDK.md](SDK.md)) |
+| `libwbprovision.a`   | host-only provisioning lib (adds the keygen surface; not shipped) |
+| `libsodium.a`        | vendored crypto dependency (built once)             |
+| `example`            | C integration demo (full lifecycle → links `libwbprovision.a`) |
 | `test_*`             | one executable per test suite                        |
 
 Source layout: `src/wbaes/` (white-box compiler), `src/vm/` (the VM),
@@ -98,7 +125,7 @@ export ANDROID_HOME="$HOME/Library/Android/sdk"
 export NDK="$ANDROID_HOME/ndk/29.0.14206865"
 export PLUGIN="$PWD/obfuscation/omvll_ndk_r29.dylib"
 export OMVLL_CONFIG="$PWD/obfuscation/omvll_config.py"
-export OMVLL_PYTHONPATH="/path/to/Python-3.10.x/Lib"   # see step 4
+export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"   # see step 4
 # macOS uses DYLD_LIBRARY_PATH (not LD_LIBRARY_PATH); the dir is darwin-x86_64
 # even on Apple Silicon:
 export DYLD_LIBRARY_PATH="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/lib64"
@@ -162,7 +189,8 @@ a fresh terminal without them will fail.
    ```sh
    curl -LO https://www.python.org/ftp/python/3.10.7/Python-3.10.7.tgz
    tar xzf Python-3.10.7.tgz
-   export OMVLL_PYTHONPATH="$PWD/Python-3.10.7/Lib"
+   mv Python-3.10.7 third_party/python
+   export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"
    ls "$OMVLL_PYTHONPATH/abc.py"      # sanity: must exist
    ```
    Also ensure `OMVLL_CONFIG` points at the config file, or the plugin reports
@@ -195,6 +223,13 @@ set. If the build crashes while *loading* the plugin, see
 > excludes STL/libc++/EH-runtime symbols. An empty or module-wide config silently
 > obfuscates *everything* (including inlined STL), which overwhelms the backend —
 > see the two crash entries in troubleshooting.
+>
+> **libsodium note:** CMake applies `-fpass-plugin` globally, so it also loads on
+> the 119 vendored `third_party/libsodium` TUs. The function-gating in
+> `omvll_config.py` rejects them (not in `_SENSITIVE_MODULES`), so no passes
+> apply — but the plugin still runs on them (extra build time, extra crash
+> surface). If the NDK build hits a backend crash, exclude `third_party/libsodium`
+> from the plugin first (compile it in a separate target without `-fpass-plugin`).
 
 ### Single-command obfuscated build via `build.sh` (host plugin)
 
@@ -217,7 +252,7 @@ Given such a plugin:
 
 ```sh
 export OMVLL_CONFIG="$PWD/obfuscation/omvll_config.py"
-export OMVLL_PYTHONPATH="/path/to/Python-3.10.x/Lib"   # plugin's embedded CPython
+export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"   # plugin's embedded CPython
 CXX=/path/to/matching/clang++  CC=/path/to/matching/clang  ZIG_BIN= \
 EXTRA_CXXFLAGS="-fpass-plugin=/path/to/host-OMVLL.dylib" \
 EXTRA_CFLAGS="-fpass-plugin=/path/to/host-OMVLL.dylib" \
@@ -225,18 +260,18 @@ EXTRA_CFLAGS="-fpass-plugin=/path/to/host-OMVLL.dylib" \
 ```
 
 or
-
 ```sh
+export PYTHONHOME="$(pyenv root)/versions/3.10.7"
+export NDK=/Users/tri.le/Library/Android/sdk/ndk/29.0.14206865
+export OMVLL_CONFIG="$PWD/obfuscation/omvll_config.py"
+export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"
+
 rm -rf build
 cmake -GNinja -B build \
   -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-  -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-24 \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_FLAGS="-fpass-plugin=$PLUGIN" \
-  -DCMAKE_CXX_FLAGS="-fpass-plugin=$PLUGIN" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,muldefs" \
-  -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,muldefs"
+  -DOMVLL_PLUGIN=$PWD/obfuscation/omvll_ndk_r29.dylib
 cmake --build build -j
 ```
 ```
@@ -335,6 +370,21 @@ strong global, defined in two TUs. Fix: exclude compiler/EH runtime helpers in
 `_is_library_fn` (`__clang_call_terminate`, `__cxa_`, `__gxx_personality` — the
 template already does) so no clone is created. Belt-and-suspenders: `-Wl,-z,muldefs`
 (added automatically when `OMVLL_PLUGIN` is set) tolerates any residual duplicate.
+
+**Compile error `Cannot inject a hooking prologue in the function <fn> (.N) since
+there is one.`** The anti-hooking pass is trying to add a prologue to a function
+that already has one. Two causes, check in order:
+1. **The plugin is applied twice** — you passed both `-DCMAKE_CXX_FLAGS=-fpass-plugin=…`
+   *and* `-DOMVLL_PLUGIN=…`. Look at the failing compile line: `-fpass-plugin=…`
+   appears **twice**. Every pass then runs twice; anti-hook injects a prologue on
+   the first run and errors on the second. Fix: pass the plugin **once** — use
+   `-DOMVLL_PLUGIN=…` alone (it adds the single `-fpass-plugin` + `-Wl,-z,muldefs`
+   for you). This is the most common cause.
+2. **Anti-hook vs control-flow flattening** — even applied once, CFF clones
+   functions (the `foo (.3)` / `foo.25` suffixes) and anti-hook then chokes on the
+   clone. Fix: leave `anti_hooking` **off** in `omvll_config.py` (the template
+   ships it off); runtime anti-hook / anti-DBI is provided by `src/rt/anti_tamper.*`
+   instead. (Both reproduced on NDK r29 / O-MVLL v1.9.1.)
 
 **Segfault (exit 139) inside `omvll.dylib` at
 `llvm::PassBuilder::registerModuleAnalyses` / `RunOptimizationPipeline`, for every

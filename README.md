@@ -44,11 +44,13 @@ for the full component-by-component implementation. All docs:
   (runtime anti-tamper); and there is no single keystream to lift statically.
   (Honest ceiling: this hardens *static analysis and tampering*, not dynamic
   tracing — see [docs/THREATMODEL.md](docs/THREATMODEL.md).)
-* **Phase 2 — trusted storage.** The compiled program is sealed at rest: the
-  table bank is stream-encrypted under a passphrase-derived key, only the
-  firmware root is stored, and an integrity tag over the VM code is folded into
-  the data-decrypt key so tampering with the VM corrupts the tables (anti-tamper
-  by binding).
+* **Phase 2 — trusted storage.** The compiled program is sealed at rest with a
+  vetted AEAD: the table bank is encrypted with XChaCha20-Poly1305 under a key
+  derived from the passphrase by Argon2id (memory-hard, random per-blob salt),
+  and the whole program header (VM code, opcode maps, sizes) is authenticated as
+  associated data. A wrong passphrase or any tamper fails authentication, so the
+  blob does not open. Crypto is vendored libsodium (`scripts/fetch_libsodium.sh`),
+  never home-rolled.
 
 ## Techniques from the deck → where they live
 
@@ -86,13 +88,16 @@ math — which is why the VM ISA is tiny.
 > (`wb_keygen`/`wb_encrypt`), a **C-ABI SDK** (`libwbcrypto.a` / `libwbcrypto.so`
 > + `include/wbcrypto.h`) for embedding in native projects, and the test suite.
 
-No system compiler/cmake is required by the build script — it discovers a C++17
-compiler (`$CXX`, then system `c++`/`g++`/`clang++`). If you only have a Zig
-toolchain, point it there:
+No system cmake is required by the build script — it discovers a C++17 compiler
+(`$CXX`/`$ZIG_BIN`, then system `c++`/`g++`/`clang++`). One dependency,
+**libsodium** (the seal's KDF+AEAD), is vendored from source with a one-time
+fetch. If you only have a Zig toolchain, drive it via `ZIG_BIN` (so `zig ar`/`zig
+cc` come along too):
 
 ```sh
+./scripts/fetch_libsodium.sh          # vendor libsodium once (pinned + SHA256)
 ./build.sh test                       # build everything and run all tests
-CXX=/path/to/zig-cxx ./build.sh test  # e.g. a `zig c++` wrapper
+ZIG_BIN=/path/to/zig ./build.sh test  # when only a Zig toolchain is available
 ```
 
 A `CMakeLists.txt` is also provided for standard toolchains (mirrors the script;
@@ -126,8 +131,9 @@ A `CMakeLists.txt` is also provided for standard toolchains (mirrors the script;
   (flipping any code byte corrupts output); **interpreter binding** (re-mapping
   opcodes breaks decode); ≈ 8 bits/byte entropy, no stored keystream.
 * `test_e2e` — seal→unseal→run == AES; **key absence** (neither key nor any
-  round key appears in the blob or the decrypted tables); **anti-tamper**
-  (flipping a VM code byte or using a wrong passphrase corrupts the output).
+  round key appears in the blob or the decrypted tables); **AEAD auth**
+  (flipping any blob byte or using a wrong passphrase fails to unseal); **salt
+  uniqueness** (same key+passphrase sealed twice → different bytes, both open).
 
 ## Threat model & honest limitations
 
@@ -145,9 +151,11 @@ and attacker model.** In short:
   the feedback-evolving firmware make static disassembly hard and any patch
   self-destruct — but the program is straight-line, so anyone who *runs/traces*
   it recovers it, and the diffused key is unaffected.
-* **Trusted-storage sealing raises the static-analysis bar, it is not secrecy.**
-  The passphrase KDF is a lightweight hash (not a real PBKDF); the integrity
-  binding gives anti-tamper, not authentication.
+* **Trusted-storage sealing protects the blob at rest, it is not key secrecy.**
+  The seal uses Argon2id + XChaCha20-Poly1305 (authenticated), which resists
+  offline passphrase guessing and tampering — but an attacker who runs the field
+  binary has the passphrase, so durable protection needs hardware-backed device
+  binding (`src/rt/device_binding.*`, roadmap).
 
 Deferred / future work (with rationale in the threat model): 32-bit mixing
 bijections, dynamic-analysis hardening (anti-debug, data-dependent control flow),

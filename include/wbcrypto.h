@@ -77,8 +77,8 @@ WBC_API wbc_status wbc_export_tables(const uint8_t key[WBC_KEY_BYTES],
 
 /* ---- Runtime: open a blob and encrypt ------------------------------------ */
 /* Open a sealed blob (as produced by wbc_seal_key or the wb_keygen CLI).
- * A wrong passphrase does not error here — it yields a context that runs but
- * produces wrong ciphertext (by design). Free with wbc_close. */
+ * The blob is authenticated (AEAD): a wrong passphrase or a tampered blob
+ * returns WBC_ERR_FORMAT rather than opening. Free with wbc_close. */
 WBC_API wbc_status wbc_open(const uint8_t* blob, size_t blob_len,
                             const char* passphrase, wbc_ctx** out_ctx);
 

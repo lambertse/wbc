@@ -2,8 +2,8 @@
 //  1. seal -> unseal -> VM run reproduces AES on the FIPS vector;
 //  2. key absence: neither the key nor any round key appears as bytes in the
 //     sealed blob or the (unsealed) table bank — it is diffused, never stored;
-//  3. anti-tamper: flipping a VM code byte, or a wrong passphrase, corrupts the
-//     output instead of leaking the correct ciphertext.
+//  3. anti-tamper: flipping any blob byte, or a wrong passphrase, fails AEAD
+//     authentication so the blob does not unseal (no correct-key leak).
 #include "test_util.h"
 #include "storage/trusted_storage.h"
 #include "vm/assembler.h"
@@ -47,29 +47,41 @@ int main() {
         CHECK(!Contains(un.data, &rk[16 * r], 16));
     }
 
-    // (3a) tamper: flip one byte in the VM code region -> wrong ciphertext.
+    // (3a) tamper: flip one byte in the VM code region (which is AEAD
+    // associated data) -> authentication fails, Unseal returns false.
     {
         std::vector<uint8_t> t = blob;
-        size_t header = 4 + 4 + 4 + 4 + 4 + 8 + 256 + 256;  // up to start of code
-        t[header + 7] ^= 0x01;
+        // v2 header up to start of code: magic(4)+version(4)+salt(16)+nonce(24)+
+        // block_off(4)+code_len(4)+data_len(4)+fw_root(8)+phys(256)+op(256).
+        size_t code_off = 4 + 4 + 16 + 24 + 4 + 4 + 4 + 8 + 256 + 256;
+        t[code_off + 7] ^= 0x01;
         vm::Program tp;
-        CHECK(storage::Unseal(t, pass, tp));
-        // Isolate the binding: the changed logic tag must re-key the data
-        // decryption, so the tables differ from the untampered ones. This holds
-        // even independent of the executed-bytecode change.
-        CHECK(tp.data != un.data);
-        auto tct = vm::Run(tp, pt);
-        Block tb; for (int i = 0; i < 16; ++i) tb[i] = tct[i];
-        CHECK(tb != ref);  // integrity binding corrupts the tables
+        CHECK(!storage::Unseal(t, pass, tp));
     }
 
-    // (3b) wrong passphrase -> wrong ciphertext (no correct-key leak).
+    // (3b) tamper in the ciphertext (encrypted table bank) -> auth fails.
+    {
+        std::vector<uint8_t> t = blob;
+        t[t.size() - 1] ^= 0x01;
+        vm::Program tp;
+        CHECK(!storage::Unseal(t, pass, tp));
+    }
+
+    // (3c) wrong passphrase -> derives a different key, auth fails.
     {
         vm::Program wp;
-        CHECK(storage::Unseal(blob, "wrong passphrase", wp));
-        auto wct = vm::Run(wp, pt);
-        Block wb2; for (int i = 0; i < 16; ++i) wb2[i] = wct[i];
-        CHECK(wb2 != ref);
+        CHECK(!storage::Unseal(blob, "wrong passphrase", wp));
+    }
+
+    // (3d) same program + passphrase sealed twice -> different bytes (random
+    // salt/nonce), but both unseal to the identical table bank.
+    {
+        std::vector<uint8_t> blob2 = storage::Seal(prog, pass);
+        CHECK(blob2.size() == blob.size());
+        CHECK(blob2 != blob);
+        vm::Program un2;
+        CHECK(storage::Unseal(blob2, pass, un2));
+        CHECK(un2.data == un.data);
     }
 
     return test::Report("test_e2e");

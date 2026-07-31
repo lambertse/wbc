@@ -1,30 +1,41 @@
 #include "storage/trusted_storage.h"
 
-#include <cstring>
+#include <sodium.h>
 
-#include "wbaes/encodings.h"  // wbaes::Rng
+#include <cstring>
+#include <new>
+#include <stdexcept>
 
 namespace storage {
 
 namespace {
 
 constexpr uint8_t kMagic[4] = {'W', 'B', 'T', 'S'};
-constexpr uint32_t kVersion = 1;
-constexpr uint64_t kKdfDomain = 0x574254535F4B4459ULL;  // "WBTS_KDY"
+constexpr uint32_t kVersion = 2;  // v2: Argon2id + XChaCha20-Poly1305 AEAD.
 
-// FNV-1a 64-bit — a compact non-cryptographic digest, sufficient for binding.
-uint64_t Hash64(const uint8_t* p, size_t n, uint64_t seed = 1469598103934665603ULL) {
-    uint64_t h = seed;
-    for (size_t i = 0; i < n; ++i) {
-        h ^= p[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
+// KDF cost. INTERACTIVE-class is the mobile-appropriate tier (a few MB..tens of
+// MB, sub-second on a phone); do NOT use the _SENSITIVE tier here (256MB+ /
+// multi-second would make wbc_open unusable on-device). Each passphrase guess
+// costs one Argon2id evaluation, which is what defuses offline guessing.
+constexpr unsigned long long kOpsLimit = crypto_pwhash_OPSLIMIT_INTERACTIVE;
+constexpr size_t kMemLimit = crypto_pwhash_MEMLIMIT_INTERACTIVE;
+
+constexpr size_t kSaltBytes = crypto_pwhash_SALTBYTES;                        // 16
+constexpr size_t kNonceBytes = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;  // 24
+constexpr size_t kKeyBytes = crypto_aead_xchacha20poly1305_ietf_KEYBYTES;     // 32
+constexpr size_t kTagBytes = crypto_aead_xchacha20poly1305_ietf_ABYTES;       // 16
+
+void EnsureSodium() {
+    // sodium_init() is idempotent and returns 1 if already initialized.
+    if (sodium_init() < 0) throw std::runtime_error("libsodium init failed");
 }
 
-uint64_t KdfStorageKey(const std::string& pass) {
-    uint64_t h = Hash64(reinterpret_cast<const uint8_t*>(pass.data()), pass.size());
-    return h ^ kKdfDomain;
+// Derive the 32-byte AEAD key from the passphrase and salt via Argon2id.
+// Returns false if the KDF fails (e.g. memory allocation).
+bool DeriveKey(const std::string& pass, const uint8_t salt[kSaltBytes],
+               uint8_t out_key[kKeyBytes]) {
+    return crypto_pwhash(out_key, kKeyBytes, pass.data(), pass.size(), salt,
+                         kOpsLimit, kMemLimit, crypto_pwhash_ALG_ARGON2ID13) == 0;
 }
 
 // ---- little-endian append/read helpers ------------------------------------
@@ -50,32 +61,29 @@ bool GetU64(const std::vector<uint8_t>& v, size_t& off, uint64_t& out) {
     return true;
 }
 
-// Integrity tag over everything that defines the program *logic* (not the data
-// tables). Any tamper here changes the tag and thus the data-decrypt key.
-uint64_t LogicTag(uint32_t block_off, uint64_t fw_root,
-                  const std::array<uint8_t, 256>& phys_to_op,
-                  const std::array<uint8_t, 256>& op_to_phys,
-                  const std::vector<uint8_t>& code) {
-    uint64_t h = Hash64(reinterpret_cast<const uint8_t*>(&block_off), 4);
-    h = Hash64(reinterpret_cast<const uint8_t*>(&fw_root), 8, h);
-    h = Hash64(phys_to_op.data(), 256, h);
-    h = Hash64(op_to_phys.data(), 256, h);
-    h = Hash64(code.data(), code.size(), h);
-    return h;
-}
-
-// XOR a buffer in place with a keystream derived from `seed`.
-void StreamXor(std::vector<uint8_t>& buf, uint64_t seed) {
-    wbaes::Rng rng(seed);
-    for (auto& b : buf) b ^= static_cast<uint8_t>(rng.next() & 0xFF);
-}
-
 }  // namespace
 
+// Blob layout (v2):
+//   magic[4] | version(u32) | salt[16] | nonce[24] |
+//   block_off(u32) | code_len(u32) | data_len(u32) | fw_root(u64) |
+//   phys_to_op[256] | op_to_phys[256] | code[code_len] |
+//   ciphertext[data_len + 16]
+// Everything before `ciphertext` is the AEAD associated data (authenticated but
+// not encrypted); `ciphertext` is AEAD(prog.data) — the diffused-key table bank.
 std::vector<uint8_t> Seal(const vm::Program& prog, const std::string& passphrase) {
+    EnsureSodium();
+
     std::vector<uint8_t> blob;
     blob.insert(blob.end(), kMagic, kMagic + 4);
     PutU32(blob, kVersion);
+
+    const size_t salt_off = blob.size();
+    blob.resize(blob.size() + kSaltBytes + kNonceBytes);
+    uint8_t* salt = blob.data() + salt_off;
+    uint8_t* nonce = salt + kSaltBytes;
+    randombytes_buf(salt, kSaltBytes);
+    randombytes_buf(nonce, kNonceBytes);
+
     PutU32(blob, prog.block_off);
     PutU32(blob, static_cast<uint32_t>(prog.code.size()));
     PutU32(blob, static_cast<uint32_t>(prog.data.size()));
@@ -84,24 +92,44 @@ std::vector<uint8_t> Seal(const vm::Program& prog, const std::string& passphrase
     blob.insert(blob.end(), prog.op_to_phys.begin(), prog.op_to_phys.end());
     blob.insert(blob.end(), prog.code.begin(), prog.code.end());
 
-    // Seal the table bank under storageKey XOR logicTag (integrity binding).
-    uint64_t tag = LogicTag(prog.block_off, prog.fw_root, prog.phys_to_op,
-                            prog.op_to_phys, prog.code);
-    uint64_t data_seed = KdfStorageKey(passphrase) ^ tag;
-    std::vector<uint8_t> sealed = prog.data;
-    StreamXor(sealed, data_seed);
-    blob.insert(blob.end(), sealed.begin(), sealed.end());
+    // The whole header so far is the associated data. Re-read salt/nonce from
+    // the (possibly reallocated) buffer.
+    const size_t header_len = blob.size();
+    uint8_t key[kKeyBytes];
+    if (!DeriveKey(passphrase, blob.data() + salt_off, key)) {
+        sodium_memzero(key, sizeof key);
+        throw std::bad_alloc();  // Argon2id arena allocation failed
+    }
+
+    std::vector<uint8_t> ct(prog.data.size() + kTagBytes);
+    unsigned long long ct_len = 0;
+    crypto_aead_xchacha20poly1305_ietf_encrypt(
+        ct.data(), &ct_len,
+        prog.data.data(), prog.data.size(),
+        blob.data(), header_len,      // associated data = header
+        nullptr,
+        blob.data() + salt_off + kSaltBytes,  // nonce
+        key);
+    sodium_memzero(key, sizeof key);
+
+    ct.resize(static_cast<size_t>(ct_len));
+    blob.insert(blob.end(), ct.begin(), ct.end());
     return blob;
 }
 
 bool Unseal(const std::vector<uint8_t>& blob, const std::string& passphrase,
             vm::Program& out) {
+    EnsureSodium();
+
     size_t off = 0;
     if (blob.size() < 4 || std::memcmp(blob.data(), kMagic, 4) != 0) return false;
     off = 4;
     uint32_t version, block_off, code_len, data_len;
     uint64_t fw_root;
     if (!GetU32(blob, off, version) || version != kVersion) return false;
+    if (off + kSaltBytes + kNonceBytes > blob.size()) return false;
+    const size_t salt_off = off;
+    off += kSaltBytes + kNonceBytes;
     if (!GetU32(blob, off, block_off)) return false;
     if (!GetU32(blob, off, code_len)) return false;
     if (!GetU32(blob, off, data_len)) return false;
@@ -115,18 +143,33 @@ bool Unseal(const std::vector<uint8_t>& blob, const std::string& passphrase,
     off += 256;
     std::copy(blob.begin() + off, blob.begin() + off + 256, out.op_to_phys.begin());
     off += 256;
-    if (off + code_len + data_len > blob.size()) return false;
-
+    if (off + code_len > blob.size()) return false;
     out.code.assign(blob.begin() + off, blob.begin() + off + code_len);
     off += code_len;
-    std::vector<uint8_t> sealed(blob.begin() + off, blob.begin() + off + data_len);
 
-    // Recompute the tag from the (possibly tampered) logic and decrypt the data.
-    uint64_t tag = LogicTag(block_off, fw_root, out.phys_to_op,
-                            out.op_to_phys, out.code);
-    uint64_t data_seed = KdfStorageKey(passphrase) ^ tag;
-    StreamXor(sealed, data_seed);
-    out.data = std::move(sealed);
+    // Everything from the start of the blob up to here is the associated data;
+    // the remainder is ciphertext+tag and must be exactly data_len + kTagBytes.
+    const size_t header_len = off;
+    const size_t ct_len = static_cast<size_t>(data_len) + kTagBytes;
+    if (header_len + ct_len != blob.size()) return false;
+
+    uint8_t key[kKeyBytes];
+    if (!DeriveKey(passphrase, blob.data() + salt_off, key)) {
+        sodium_memzero(key, sizeof key);
+        return false;
+    }
+
+    out.data.resize(data_len);
+    unsigned long long pt_len = 0;
+    int rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
+        out.data.data(), &pt_len, nullptr,
+        blob.data() + header_len, ct_len,
+        blob.data(), header_len,                 // associated data = header
+        blob.data() + salt_off + kSaltBytes,     // nonce
+        key);
+    sodium_memzero(key, sizeof key);
+    if (rc != 0) return false;  // wrong passphrase or tampered blob
+    out.data.resize(static_cast<size_t>(pt_len));
     return true;
 }
 

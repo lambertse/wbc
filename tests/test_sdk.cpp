@@ -52,17 +52,55 @@ int main() {
     CHECK(wbc_crypt_ctr(ctx, iv, enc.data(), dec.data(), mlen) == WBC_OK);
     CHECK(std::memcmp(dec.data(), msg, mlen) == 0);
 
-    // wrong passphrase -> opens but produces wrong output (no key leak).
+    // wrong passphrase -> AEAD auth fails, blob does not open (v2 contract).
     wbc_ctx* wctx = nullptr;
-    CHECK(wbc_open(blob, blen, "nope", &wctx) == WBC_OK);
-    uint8_t wct[16];
-    CHECK(wbc_encrypt_block(wctx, pt.data(), wct) == WBC_OK);
-    CHECK(std::memcmp(wct, ref.data(), 16) != 0);
+    CHECK(wbc_open(blob, blen, "nope", &wctx) == WBC_ERR_FORMAT);
+    CHECK(wctx == nullptr);
+
+    // tamper: flip one byte anywhere -> auth fails, does not open.
+    {
+        std::vector<uint8_t> t(blob, blob + blen);
+        t[blen / 2] ^= 0x01;
+        wbc_ctx* tctx = nullptr;
+        CHECK(wbc_open(t.data(), t.size(), "pw", &tctx) == WBC_ERR_FORMAT);
+        CHECK(tctx == nullptr);
+    }
+
+    // salt/nonce are random per seal -> same key+pass => different blob bytes.
+    {
+        uint8_t* blob2 = nullptr; size_t blen2 = 0;
+        CHECK(wbc_seal_key(key.data(), "pw", 42, 1, &blob2, &blen2) == WBC_OK);
+        CHECK(blen2 == blen);
+        CHECK(std::memcmp(blob, blob2, blen) != 0);
+        // ...but it still opens and encrypts identically.
+        wbc_ctx* c2 = nullptr;
+        CHECK(wbc_open(blob2, blen2, "pw", &c2) == WBC_OK);
+        uint8_t ct2[16];
+        CHECK(wbc_encrypt_block(c2, pt.data(), ct2) == WBC_OK);
+        CHECK(std::memcmp(ct2, ref.data(), 16) == 0);
+        wbc_close(c2); wbc_free(blob2);
+    }
+
+    // NULL passphrase (documented as "treated as empty") round-trips through
+    // the Argon2id KDF and unseals to the correct FIPS vector.
+    {
+        uint8_t* nblob = nullptr; size_t nlen = 0;
+        CHECK(wbc_seal_key(key.data(), nullptr, 7, 1, &nblob, &nlen) == WBC_OK);
+        wbc_ctx* nctx = nullptr;
+        CHECK(wbc_open(nblob, nlen, nullptr, &nctx) == WBC_OK);
+        uint8_t nct[16];
+        CHECK(wbc_encrypt_block(nctx, pt.data(), nct) == WBC_OK);
+        CHECK(std::memcmp(nct, ref.data(), 16) == 0);
+        // NULL == "" : a blob sealed with NULL opens with "" and vice versa.
+        wbc_ctx* ectx = nullptr;
+        CHECK(wbc_open(nblob, nlen, "", &ectx) == WBC_OK);
+        wbc_close(nctx); wbc_close(ectx); wbc_free(nblob);
+    }
 
     // error paths.
     CHECK(wbc_open(blob, 3, "pw", &ctx) == WBC_ERR_FORMAT);
     CHECK(wbc_seal_key(nullptr, "pw", 0, 1, &blob, &blen) == WBC_ERR_ARG);
 
-    wbc_close(ctx); wbc_close(wctx); wbc_free(blob);
+    wbc_close(ctx); wbc_free(blob);
     return test::Report("test_sdk");
 }

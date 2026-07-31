@@ -1,4 +1,11 @@
-// wbcrypto.cpp — C ABI implementation over the C++ white-box VM core.
+// wbcrypto.cpp — C ABI RUNTIME implementation over the C++ white-box VM core.
+//
+// This translation unit is the one that SHIPS in libwbcrypto.{a,so}. It must
+// contain only the field-side runtime: open a sealed blob and encrypt. The
+// key-generation surface (wbc_seal_key / wbc_export_tables, which pull in the
+// reference AES, the white-box generator, and the assembler) lives in the
+// separate wbcrypto_provision.cpp so that code never ships alongside the thing
+// that must not reveal the key. See docs/BUILD.md (runtime vs provisioning).
 //
 // All entry points are noexcept boundaries: C++ exceptions (e.g. bad_alloc) are
 // caught and translated to wbc_status codes so they never cross into C callers.
@@ -10,10 +17,7 @@
 #include <new>
 
 #include "storage/trusted_storage.h"
-#include "vm/assembler.h"
 #include "vm/vm.h"
-#include "wbaes/wb_export.h"
-#include "wbaes/wb_generator.h"
 
 struct wbc_ctx {
     vm::Program prog;
@@ -33,52 +37,9 @@ const char* wbc_strerror(wbc_status s) {
     return "unknown";
 }
 
-wbc_status wbc_seal_key(const uint8_t key[WBC_KEY_BYTES], const char* passphrase,
-                        uint64_t seed, int hardened, uint8_t** out_blob,
-                        size_t* out_len) {
-    if (!key || !out_blob || !out_len) return WBC_ERR_ARG;
-    try {
-        wbaes::Key128 k{};
-        std::memcpy(k.data(), key, WBC_KEY_BYTES);
-        auto wb = wbaes::GenerateWhiteBox(k, seed, wbaes::WBLevel::Internal);
-        vm::ObfOptions obf = hardened ? vm::ObfOptions::All() : vm::ObfOptions::None();
-        vm::Program prog = vm::AssembleWhiteBox(*wb, seed ^ 0x9999u, obf);
-        std::string pass = passphrase ? passphrase : "";
-        std::vector<uint8_t> blob = storage::Seal(prog, pass);
-
-        uint8_t* buf = static_cast<uint8_t*>(std::malloc(blob.size()));
-        if (!buf) return WBC_ERR_NOMEM;
-        std::memcpy(buf, blob.data(), blob.size());
-        *out_blob = buf;
-        *out_len = blob.size();
-        return WBC_OK;
-    } catch (const std::bad_alloc&) {
-        return WBC_ERR_NOMEM;
-    } catch (...) {
-        return WBC_ERR_ARG;
-    }
-}
-
-wbc_status wbc_export_tables(const uint8_t key[WBC_KEY_BYTES], uint64_t seed,
-                             uint8_t** out_image, size_t* out_len) {
-    if (!key || !out_image || !out_len) return WBC_ERR_ARG;
-    try {
-        wbaes::Key128 k{};
-        std::memcpy(k.data(), key, WBC_KEY_BYTES);
-        auto wb = wbaes::GenerateWhiteBox(k, seed, wbaes::WBLevel::Internal);
-        std::vector<uint8_t> img = wbaes::ExportTableImage(*wb);
-        uint8_t* buf = static_cast<uint8_t*>(std::malloc(img.size()));
-        if (!buf) return WBC_ERR_NOMEM;
-        std::memcpy(buf, img.data(), img.size());
-        *out_image = buf;
-        *out_len = img.size();
-        return WBC_OK;
-    } catch (const std::bad_alloc&) {
-        return WBC_ERR_NOMEM;
-    } catch (...) {
-        return WBC_ERR_ARG;
-    }
-}
+/* wbc_seal_key and wbc_export_tables are the key-generation surface; they live
+ * in wbcrypto_provision.cpp (provisioning build) and are deliberately NOT part
+ * of the shipped runtime library. */
 
 wbc_status wbc_open(const uint8_t* blob, size_t blob_len, const char* passphrase,
                     wbc_ctx** out_ctx) {

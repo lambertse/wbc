@@ -22,7 +22,7 @@ trace** the code.
 | **VM virtualization** (custom ISA, FDE dispatcher, handler table) | Recognizing the algorithm as AES from a static disassembly | Someone who runs/traces the VM (the program is straight-line and data-oblivious, so one trace reveals it) |
 | **Opcode blinding, MBA, opaque predicates** | Static pattern-matching of opcodes and operations | Dynamic analysis; the crypto key |
 | **Context-keyed firmware encryption** (W1) | Lifting a stored keystream (there is none); bulk static decode (decode evolves with execution); **tampering** (any code-byte or opcode-map edit cascades to garbage) | Dynamic tracing (hook the decode / run once); the crypto key |
-| **Trusted-storage sealing** | Reading the tables at rest (stream-encrypted); silent tampering (integrity binding corrupts output) | Cryptographic secrecy — everything needed to run is in the blob; the KDF is a lightweight hash, not a PBKDF/AEAD |
+| **Trusted-storage sealing** (Argon2id + XChaCha20-Poly1305) | Reading the tables at rest (AEAD-encrypted); offline passphrase guessing (memory-hard KDF, random per-blob salt); tampering (authenticated — a wrong key or any edit fails to open) | Cryptographic secrecy of the *key* — everything needed to run is in the blob, and an attacker who runs the field binary has the passphrase. Real durable value needs hardware-backed binding (see below). |
 | **Freestanding device runtime** (`wb_stub.h`) | Shipping a raw key in a packer/APK — the key is diffused in the injected table image | Cryptanalysis (same Chow ceiling); it deliberately omits the VM/firmware layers (runs tables directly) |
 
 ## Attacker capabilities
@@ -44,6 +44,32 @@ trace** the code.
   broken (BGE, Billet et al.). Obfuscation raises the effort to *set up* the
   attack, not its fundamental feasibility.
 
+## Build hygiene (shipped)
+
+The release build no longer helps the attacker:
+
+- **Runtime / provisioning split.** The shipped `libwbcrypto.{a,so}` contains
+  only the field runtime (open a blob + encrypt). The reference AES, key
+  expansion, white-box generator (`GenerateWhiteBox`), and bytecode assembler
+  live in a separate provisioning library (`libwbprovision.a`) linked only into
+  the offline `wb_keygen` tool. See docs/BUILD.md.
+- **Symbol hygiene.** `-fvisibility=hidden` + a linker version script export
+  only the `wbc_*` C ABI; the shared object is stripped (no symbol table, no
+  DWARF), so it ships neither a labelled map of the internals nor source paths.
+
+## External input/output encodings (P1.1) — why the raw API is kept
+
+The white-box takes raw plaintext and returns raw ciphertext, which is exactly
+the configuration BGE targets. External I/O encodings (secret bijections on the
+white-box boundary, folded into the first/last table layers) break *naive* BGE —
+but only if they cannot be peeled at the boundary. This SDK's boundary is an
+**arbitrary caller** with no surrounding application logic to fuse the encoding
+into, so a caller-side wrapper that applies/strips the encoding is itself on the
+attacker's device and can be lifted. External encodings therefore add durable
+work-factor only in a *specific deployment* that fuses them into other
+computation (transport framing, format handling). They are deliberately **not**
+implemented at the generic SDK boundary; adopt them per-integration.
+
 ## Deliberately deferred / future work
 
 - **32-bit mixing bijections (Chow type II/III).** Considered and **not shipped**.
@@ -56,14 +82,24 @@ trace** the code.
   including the freestanding stub) versus that bounded, unverifiable payoff, it is
   documented here rather than implemented.
 - **Dynamic-analysis resistance.** Anti-debugging, data-dependent control flow,
-  runtime interpreter self-integrity, timing checks. Large, OS/arch-specific, and
-  with a known ceiling (VMs are deobfuscatable via symbolic execution + program
-  synthesis — the thesis of the source deck).
+  runtime interpreter self-integrity, timing checks. A first cut ships as an
+  **Android/Linux code-drop** (`src/rt/anti_tamper.*`) — TracerPid / Frida-map /
+  ptrace / timing checks that degrade silently into key derivation — but it is
+  **not yet wired into a verified build or validated on-device** (see
+  docs/ANTI-TAMPER.md). Known ceiling: VMs are deobfuscatable via symbolic
+  execution + program synthesis.
+- **Hardware-backed device binding.** `src/rt/device_binding.*` defines the
+  contract for deriving the seal key from Android Keystore/StrongBox
+  (non-exportable) so a stolen blob + passphrase is useless off-device — the
+  highest-value durable item. Contract/stub only; needs the JNI bridge and
+  on-device validation.
 - **Genuinely key-hardening constructions.** Space-hard / incompressible
   white-boxes (e.g. SPACE-family) argue *code-lifting* resistance rather than key
   secrecy — a different security model and a much larger build.
-- **Real at-rest crypto.** Replace the lightweight KDF/stream seal with a proper
-  PBKDF/Argon2 + AEAD if the blob must resist offline attack on the passphrase.
+- **Real at-rest crypto. (DONE)** The seal now uses Argon2id (memory-hard KDF,
+  random per-blob salt) + XChaCha20-Poly1305 (AEAD, random nonce, header
+  authenticated) from vendored libsodium. A wrong passphrase or any tamper fails
+  authentication; each guess costs one Argon2id evaluation.
 
 ## Bottom line
 

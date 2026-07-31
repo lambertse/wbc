@@ -1,7 +1,14 @@
 /* example.c — how a native project integrates the White-box Crypto VM SDK.
  *
- * Pure C, links against libwbcrypto (static or shared). Build (see docs/SDK.md):
- *   cc example.c -I../include -L../build -lwbcrypto -o example
+ * This demo shows the FULL lifecycle (seal a key + run), so it links the
+ * host-only PROVISIONING library (libwbprovision), which contains wbc_seal_key.
+ *
+ * A real FIELD app does NOT seal on-device: it links only the runtime library
+ *   cc app.c -I../include -L../build -lwbcrypto -o app
+ * and calls only wbc_open / wbc_encrypt_* on a blob produced offline by the
+ * provisioning tool (wb_keygen). The runtime libwbcrypto.so deliberately does
+ * not export wbc_seal_key or the reference AES / white-box generator. See
+ * docs/SDK.md and docs/BUILD.md.
  */
 #include <stdio.h>
 #include <string.h>

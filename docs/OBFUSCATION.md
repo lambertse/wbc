@@ -117,6 +117,34 @@ build (the Android `arm64-v8a` artifacts don't run on the macOS host):
 4. Spot-check hardening statically: the obfuscated `libwbcrypto.so` should show
    flattened control flow in a disassembler and a larger `.text`.
 
+## Performance & targeting (the hot-path trap)
+
+O-MVLL only raises the cost of *statically* reading the native code. It does not
+move the cryptanalytic key-extraction ceiling and does not stop a dynamic
+attacker who dumps memory — so treat it as a P2 pass behind external encodings
+and the dynamic-path defenses (see docs/THREATMODEL.md and docs/ANTI-TAMPER.md).
+
+Target **cold, high-value** code heavily; leave the **hot interpreter loop**
+nearly untouched:
+
+- The VM executes thousands of ops per 16-byte block. Flattening / MBA / opaque
+  passes inside `vm.cpp` (dispatch loop) and `handlers.cpp` (handler bodies)
+  multiply by that op count — potentially 5-20x throughput for protection a
+  dynamic attacker ignores (the interpreter is data-oblivious). `omvll_config.py`
+  therefore lists these in `_HOT_MODULES` and keeps the heavy passes OFF there,
+  leaving only light `break_control_flow`.
+- Obfuscate the code that gates a *cheap offline* attack: `trusted_storage.cpp`
+  (seal/unseal + the blob loader), `assembler.cpp`, and the SDK glue. These run
+  once, so flatten/opaque/string them freely.
+- **Benchmark** `wbc_encrypt_block` / `wbc_crypt_ctr` before/after and treat a
+  regression beyond budget as a build failure.
+
+Note on external playbooks: O-MVLL config examples from generic hardening guides
+often name translation units (`seal.cpp`, `loader.cpp`, `binding.cpp`) and
+strings (`ro.arch`, device props) that **do not exist in this project**. Map any
+such guidance onto the real TUs above — a config gated on a non-existent module
+name silently obfuscates nothing.
+
 ## Other options
 
 - **OLLVM forks** (Hikari, Arkari, Pluto) — older LLVM pass sets (CFF, bogus CFG,

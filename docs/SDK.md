@@ -31,17 +31,19 @@ example are produced automatically alongside the tools and tests.
 const char* wbc_version(void);
 const char* wbc_strerror(wbc_status);
 
-/* offline: seal a 16-byte key into a trusted-storage blob (malloc'd out_blob) */
+/* offline / PROVISIONING ONLY (libwbprovision, NOT the shipped runtime):
+ * seal a 16-byte key into a trusted-storage blob (malloc'd out_blob) */
 wbc_status wbc_seal_key(const uint8_t key[16], const char* passphrase,
                         uint64_t seed, int hardened,
                         uint8_t** out_blob, size_t* out_len);
 
-/* offline: export a flat table image for the freestanding device runtime
- * (see INTEGRATION-native-lib-encryption.md); *out_image is malloc'd */
+/* offline / PROVISIONING ONLY: export a flat table image for the freestanding
+ * device runtime (see INTEGRATION-native-lib-encryption.md); malloc'd */
 wbc_status wbc_export_tables(const uint8_t key[16], uint64_t seed,
                              uint8_t** out_image, size_t* out_len);
 
-/* runtime */
+/* runtime (shipped in libwbcrypto). wbc_open AUTHENTICATES the blob: a wrong
+ * passphrase or any tamper returns WBC_ERR_FORMAT rather than opening. */
 wbc_status wbc_open(const uint8_t* blob, size_t len, const char* passphrase, wbc_ctx** out);
 wbc_status wbc_encrypt_block(wbc_ctx*, const uint8_t in[16], uint8_t out[16]); /* ECB, 1 block */
 wbc_status wbc_encrypt_ecb  (wbc_ctx*, const uint8_t* in, uint8_t* out, size_t len); /* len %16==0 */

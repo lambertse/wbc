@@ -20,7 +20,7 @@
 #
 # Usage (the tested path is the Android NDK cross-compile — see docs/BUILD.md):
 #   export OMVLL_CONFIG=$PWD/obfuscation/omvll_config.py
-#   export OMVLL_PYTHONPATH=/path/to/Python-3.10.x/Lib   # plugin's embedded CPython
+#   export OMVLL_PYTHONPATH=$PWD/third_party/python/Lib   # plugin's embedded CPython
 #   cmake -GNinja -B build \
 #     -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
 #     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
@@ -41,13 +41,39 @@ from functools import lru_cache
 _SENSITIVE_MODULES = (
     "vm.cpp", "handlers.cpp", "assembler.cpp",   # the interpreter + compiler
     "fwcrypt.cpp", "fw_schedule",                # the firmware decode schedule
-    "trusted_storage.cpp",                       # sealing / KDF
-    "wbcrypto.cpp",                              # SDK glue
+    "trusted_storage.cpp",                       # sealing / KDF (holds WBTS magic)
+    "wbcrypto.cpp", "wbcrypto_provision.cpp",    # SDK glue (runtime + provisioning)
     "wb_stub", "selftest.c",                     # freestanding device runtime
 )
 # Modules that must stay libc-free: only CFG/arithmetic/opaque passes are safe
 # here — NO string encoding, NO anti-hooking (they emit decoder stubs / libc).
 _FREESTANDING_MODULES = ("wb_stub", "selftest.c")
+
+# HOT interpreter path — the fetch/decode/dispatch loop and handler bodies run
+# thousands of times per 16-byte block, so any heavy pass here multiplies by the
+# VM op count (control-flow flattening can cost 5-20x throughput). These TUs are
+# still "sensitive" for LIGHT passes (break_control_flow), but the HEAVY ones
+# (flatten, MBA, opaque constants, struct-access) are kept OFF here. The static
+# value of obfuscating the interpreter is low anyway: it is data-oblivious, so a
+# dynamic attacker who traces one block recovers it regardless. Obfuscate the
+# COLD code that gates a cheap offline attack (seal/unseal + loader in
+# trusted_storage.cpp, the assembler, the SDK glue) heavily instead. See the
+# "performance trap" in the Pass-2 O-MVLL addendum / docs/OBFUSCATION.md.
+_HOT_MODULES = ("vm.cpp", "handlers.cpp")
+
+# COLD gate TUs where MBA (arithmetic obfuscation) is worth its cost. These run
+# ONCE (seal/unseal + KDF wiring; the bytecode compiler), so the heavy pass adds
+# static-analysis resistance at ~no runtime cost. MBA is the most crash-prone
+# O-MVLL pass, so it is scoped to this small set (not all sensitive TUs); if the
+# backend crashes on it, shrink this tuple further or set obfuscate_arithmetic
+# back to `return False`.
+_MBA_MODULES = ("trusted_storage.cpp", "assembler.cpp")
+
+def _is_hot(mod):
+    return any(h in _mod_name(mod) for h in _HOT_MODULES)
+
+def _wants_mba(mod):
+    return any(m in _mod_name(mod) for m in _MBA_MODULES)
 
 def _is_library_fn(func):
     name = getattr(func, "name", "") or ""
@@ -81,6 +107,11 @@ def _is_freestanding(mod, _func):
     n = _mod_name(mod)
     return any(s in n for s in _FREESTANDING_MODULES)
 
+def _sensitive_nonfree(mod, func):
+    # Sensitive AND not a no-libc module — the set that may receive the passes
+    # that emit decoder stubs / libc calls (string & constant encryption).
+    return _sensitive(mod, func) and not _is_freestanding(mod, func)
+
 
 # --- Config ------------------------------------------------------------------
 # Bring passes up GRADUALLY, not all at once. A known-stable starting point is
@@ -93,36 +124,58 @@ class Config(omvll.ObfuscationConfig):
     def __init__(self):
         super().__init__()
 
-    # Control-flow flattening — safe everywhere (no libc), high value on the
-    # dispatcher and handlers.
+    # Control-flow flattening — high value on the COLD gate code (seal/unseal,
+    # loader, SDK glue), but excluded from the HOT interpreter path (per-VM-op,
+    # 5-20x throughput cost for protection a dynamic attacker ignores).
     def flatten_functions(self, mod, func):
-        return _sensitive(mod, func)
+        return _sensitive(mod, func) and not _is_hot(mod)
 
-    # Jump-into-the-middle / bogus CFG — safe, breaks linear disassembly.
+    # Jump-into-the-middle / bogus CFG — lighter than flattening, so it is left
+    # ON even for the hot path (breaks linear disassembly at modest cost).
     def break_control_flow(self, mod, func):
         return _sensitive(mod, func)
 
-    # Arithmetic obfuscation (MBA) on the native code — complements the
-    # bytecode-level MBA. Safe for freestanding.
+    # Arithmetic obfuscation (MBA) — rewrites arithmetic/logic into opaque
+    # mixed boolean-arithmetic, the strongest STATIC hardening of the code's
+    # semantics. Enabled ONLY on the cold gate TUs (_MBA_MODULES): they run once,
+    # so there is no runtime cost, and the small set limits MBA's backend-crash
+    # risk. NOT on the hot interpreter (per-op cost) and NOT globally. A bare
+    # `True` uses O-MVLL's default rounds. If the backend crashes on this pass,
+    # shrink _MBA_MODULES or return False.
     def obfuscate_arithmetic(self, mod, func):
-        return None
+        return _wants_mba(mod) and not _is_library_fn(func)
 
+    # Opaque / encrypted constants — hides the WBTS seal magic, the SplitMix64 /
+    # FNV constants, and S-box references so they are not recoverable by a
+    # constant scan. Not freestanding-safe (decoder), so host/runtime only; and
+    # excluded from the hot path (per-op constant materialization is costly).
     def obfuscate_constants(self, mod, func):
-        return False
+        return _sensitive_nonfree(mod, func) and not _is_hot(mod)
 
-    # Opaque struct-field access — safe.
+    # Opaque struct-field access — excluded from the hot path: the dispatch loop
+    # touches VMContext fields every op, so obfuscating that access is per-op.
     def obfuscate_struct_access(self, mod, func, struct):
-        return _sensitive(mod, func)
+        return _sensitive(mod, func) and not _is_hot(mod)
 
-    # String encoding — NOT freestanding-safe (adds a decoder stub). Host code
-    # only; the crypto has no meaningful strings anyway, so default off.
+    # String encoding — NOT freestanding-safe (adds a decoder stub). Encrypts
+    # string literals in the sensitive host/runtime TUs (e.g. the "WBTS" magic in
+    # trusted_storage.cpp) so `strings` does not reveal them. A bare `True`
+    # enables encoding (O-MVLL default); return omvll.StringEncOptLocal() instead
+    # for in-function decode (stronger vs memory dumps) on the most sensitive TUs.
     def obfuscate_string(self, mod, func, string):
-        return False
+        return _sensitive_nonfree(mod, func) and not _is_hot(mod)
 
-    # Anti-hooking — NOT freestanding-safe (calls into libc / syscalls). Enable
-    # only on host SDK/CLI code if you want it, never on the stub.
+    # Anti-hooking — OFF. It conflicts with control-flow flattening: CFF clones
+    # functions (the `foo (.3)` / `foo.25` suffixes), and the anti-hook pass then
+    # fails on the clone with
+    #     error: Cannot inject a hooking prologue in the function <fn> since there is one.
+    # (observed on NDK r29 / O-MVLL v1.9.1 with flatten_functions enabled). The
+    # anti-hook / anti-DBI capability is provided instead by src/rt/anti_tamper.*
+    # (TracerPid / Frida-map / ptrace / timing, degrading silently into key
+    # derivation). If you ever want O-MVLL's version, enable it only on a function
+    # set that is NOT also flattened.
     def anti_hooking(self, mod, func):
-        return _sensitive(mod, func) and not _is_freestanding(mod, func) and False
+        return False
 
 
 @lru_cache(maxsize=1)

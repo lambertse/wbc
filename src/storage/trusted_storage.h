@@ -1,17 +1,19 @@
 // trusted_storage.h — seal a compiled white-box Program into an at-rest blob.
 //
-// This is the "trusted storage" wrapper around the white-box VM. On disk:
-//   * the table bank (which holds the diffused key) is never in plaintext — it
-//     is stream-sealed under a passphrase-derived storage key;
-//   * the bytecode keystream is stored only as an 8-byte seed, not literally;
-//   * an integrity tag over the program logic (code + opcode maps + seeds) is
-//     folded into the data-decrypt key, so any tamper with the VM code makes
-//     the tables decrypt to garbage and the cipher output goes wrong
-//     (anti-tamper by binding, not by a checked-then-ignored MAC).
+// This is the "trusted storage" wrapper around the white-box VM. On disk the
+// table bank (which holds the diffused key) is encrypted with a vetted AEAD
+// (XChaCha20-Poly1305) under a key derived from the passphrase with a real,
+// memory-hard KDF (Argon2id) and a random per-blob salt. The rest of the
+// program logic (magic, version, sizes, fw_root, opcode maps, bytecode) is
+// bound as the AEAD's associated data, so any tamper — to the tables OR to the
+// logic — fails authentication.
 //
-// Honesty: the passphrase KDF here is a lightweight hash, not a real PBKDF, and
-// the whole scheme raises the bar for *static* extraction rather than providing
-// cryptographic key secrecy — see README.
+// This replaces an earlier home-rolled construction (SplitMix64 XOR keystream +
+// unkeyed FNV integrity tag) which had no KDF, no per-blob salt/nonce, and a
+// forgeable tag. See docs/THREATMODEL.md. In the white-box threat model an
+// attacker who runs the field binary has the passphrase, so the seal's role is
+// to protect the blob AT REST and raise the offline-extraction bar; its durable
+// value comes with hardware-backed key binding (docs, P2.4).
 #ifndef WBVM_STORAGE_TRUSTED_STORAGE_H
 #define WBVM_STORAGE_TRUSTED_STORAGE_H
 
@@ -23,12 +25,15 @@
 
 namespace storage {
 
-// Serialize + seal `prog` under `passphrase`. Returns the blob bytes.
+// Serialize + seal `prog` under `passphrase`. Each call uses a fresh random
+// salt and nonce, so sealing the same program twice yields different bytes.
+// Throws std::bad_alloc if the KDF cannot allocate its memory arena.
 std::vector<uint8_t> Seal(const vm::Program& prog, const std::string& passphrase);
 
 // Parse + unseal a blob under `passphrase` into `out`. Returns false on a
-// malformed blob. NOTE: a wrong passphrase or a tampered blob does not error —
-// it yields a Program that runs but produces wrong ciphertext (by design).
+// malformed blob, a wrong passphrase, OR a tampered blob (AEAD authentication
+// failure) — unlike the previous construction, a wrong key no longer "opens"
+// to a wrong-output program.
 bool Unseal(const std::vector<uint8_t>& blob, const std::string& passphrase,
             vm::Program& out);
 
