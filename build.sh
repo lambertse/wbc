@@ -77,11 +77,15 @@ fi
 # visibility("default") in wbcrypto.h) and, via the version script below, the
 # public surface end up exported. -ffunction/data-sections lets --gc-sections
 # drop dead code from the shipped .so.
-# Optimization level. -O3 matches what the CMake/NDK path already gets from its
-# toolchain file, so host and device numbers are comparable; before this they
-# differed (-O2 here, -O3 there), which silently skewed any A/B. Overridable for
-# flag experiments: OPT_LEVEL=-O2 ./build.sh
-OPT_LEVEL="${OPT_LEVEL:--O3}"
+# Optimization level. -O2 is the default because it is what this script has
+# always used and -O3 was measured to make no difference to the VM hot path (the
+# per-instruction decode is a serial dependency chain, so it is latency-bound and
+# there is nothing for the extra passes to win). The CMake/NDK path gets -O3 from
+# its toolchain file; that mismatch does NOT contaminate the on-device A/B, which
+# builds both sides through CMake. Override for flag experiments:
+#   OPT_LEVEL=-O3 ./build.sh
+# and use scripts/bench_host_ab.sh to compare, rather than eyeballing two runs.
+OPT_LEVEL="${OPT_LEVEL:--O2}"
 INCS=(-Isrc -Iinclude -Itests "-I$SODIUM_INC")
 CXXFLAGS=(-std=c++17 "$OPT_LEVEL" "${INCS[@]}" -Wall -Wextra -Wno-nullability-completeness
           -fvisibility=hidden -fvisibility-inlines-hidden
