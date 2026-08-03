@@ -53,9 +53,11 @@ int main(void) {
     s = wbc_open(blob, blob_len, pass, &ctx);
     if (s != WBC_OK) { fprintf(stderr, "open: %s\n", wbc_strerror(s)); return 1; }
 
-    uint8_t* payload = malloc(PAYLOAD_BYTES);
-    uint8_t* sealed = malloc(PAYLOAD_BYTES + WBC_BULK_OVERHEAD);
-    uint8_t* opened = malloc(PAYLOAD_BYTES);
+    /* Casts are redundant in C, but kept so this file also compiles cleanly if
+     * someone builds it as C++ (where void* does not convert implicitly). */
+    uint8_t* payload = (uint8_t*)malloc(PAYLOAD_BYTES);
+    uint8_t* sealed = (uint8_t*)malloc(PAYLOAD_BYTES + WBC_BULK_OVERHEAD);
+    uint8_t* opened = (uint8_t*)malloc(PAYLOAD_BYTES);
     if (!payload || !sealed || !opened) { fprintf(stderr, "oom\n"); return 1; }
     for (size_t i = 0; i < PAYLOAD_BYTES; ++i) payload[i] = (uint8_t)(i * 31u + 7u);
 

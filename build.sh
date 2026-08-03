@@ -247,15 +247,23 @@ if [ ${#ARCMD[@]} -ne 0 ]; then
     "${ARCMD[@]}" rcs "$BUILD/libwbprovision.a" \
         "${RT_OBJS[@]}" "${PV_OBJS[@]}" "${SODIUM_OBJS[@]}"
 
-    # C integration example. It demonstrates the FULL lifecycle (seal offline +
-    # run), so it links the host PROVISIONING archive (libwbprovision.a, which
+    # C integration examples. They demonstrate the FULL lifecycle (seal offline +
+    # run), so they link the host PROVISIONING archive (libwbprovision.a, which
     # also contains the runtime). A real field app links only libwbcrypto.so and
-    # never calls wbc_seal_key. Linked with the C++ driver so libc++ resolves.
+    # never calls wbc_seal_key.
+    #
+    # Driven by the C++ compiler so libc++ resolves at link, but `-x c` forces
+    # the SOURCE to be compiled as C. Without it the driver compiles .c as C++
+    # ("treating 'c' input as 'c++' ... deprecated") and these files then have to
+    # satisfy C++ rules they were never written for — e.g. no implicit void*
+    # conversion, so a plain malloc() is a hard error. `-x none` afterwards puts
+    # the driver back to by-extension handling for the archive.
     for ex in examples/*.c; do
         [ -f "$ex" ] || continue
         exname=$(basename "$ex" .c)
         echo "build example: $exname (C, links libwbprovision.a)"
-        "${CXXCMD[@]}" -Iinclude ${EXTRA_C_ARR[@]+"${EXTRA_C_ARR[@]}"} "$ex" \
+        "${CXXCMD[@]}" -Iinclude ${EXTRA_C_ARR[@]+"${EXTRA_C_ARR[@]}"} \
+            -x c "$ex" -x none \
             "$BUILD/libwbprovision.a" ${EXTRA_LD_ARR[@]+"${EXTRA_LD_ARR[@]}"} -o "$BUILD/$exname"
     done
 else
