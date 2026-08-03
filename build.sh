@@ -186,7 +186,13 @@ done
 # NOTE: `./build.sh test` iterates only TESTS, so it does NOT run wb_bench. That
 # is intentional — a benchmark asserts nothing and would only slow the suite down.
 if [ -f bench/wb_bench.cpp ]; then
-    echo "build bench: wb_bench"; build_bin wb_bench bench/wb_bench.cpp
+    echo "build bench: wb_bench"; build_bin wb_bench -Ibench bench/wb_bench.cpp
+fi
+# Attribution ladder: plain AES vs the table network vs the VM. Needs the
+# PROVISIONING set (it generates its own white-box), which build_bin links
+# anyway; under CMake it gets its own target for the same reason.
+if [ -f bench/wb_ladder.cpp ]; then
+    echo "build bench: wb_ladder"; build_bin wb_ladder -Ibench bench/wb_ladder.cpp
 fi
 
 # ---- SDK libraries ---------------------------------------------------------

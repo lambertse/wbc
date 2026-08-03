@@ -197,7 +197,17 @@ target_include_directories(wb_encrypt PRIVATE ${WBVM_INCLUDES})
 # scripts/bench_android.sh; see docs/BUILD.md ("Benchmarks").
 add_executable(wb_bench ${CMAKE_SOURCE_DIR}/bench/wb_bench.cpp)
 target_link_libraries(wb_bench PRIVATE wbcrypto_static)
-target_include_directories(wb_bench PRIVATE ${WBVM_INCLUDES})
+target_include_directories(wb_bench PRIVATE ${WBVM_INCLUDES} ${CMAKE_SOURCE_DIR}/bench)
+
+# Attribution ladder: plain AES vs the Chow table network vs the VM, to show what
+# the per-block cost is MADE OF. It generates its own white-box from a known key
+# (no blob, no KDF), so unlike wb_bench it MUST link the provisioning library —
+# aes_ref / wb_interp / wb_generator / the assembler all live there. That is why
+# it is a separate binary: wb_bench's runtime-only linkage is an invariant worth
+# keeping, and this target is host-side analysis, never shipped.
+add_executable(wb_ladder ${CMAKE_SOURCE_DIR}/bench/wb_ladder.cpp)
+target_link_libraries(wb_ladder PRIVATE wbprovision)
+target_include_directories(wb_ladder PRIVATE ${WBVM_INCLUDES} ${CMAKE_SOURCE_DIR}/bench)
 
 # C integration examples (full lifecycle -> link the provisioning library).
 #   example  — the basic open/encrypt lifecycle
