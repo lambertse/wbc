@@ -27,7 +27,9 @@ that decides the case.** It shows the passphrase living inside the integration
    ChaCha20-Poly1305), decrypting the white-box table bank in memory.
 3. Drives the white-box as an AES oracle with the **FIPS-197** known-answer vector and
    confirms it reproduces `69c4e0d8…c55a` → the sealed key is `000102…0f`.
-4. CTR encrypt/decrypt round-trip.
+4. Wraps a fresh session key through the white-box (`wbc_wrap_key`), AEAD-seals the
+   payload under it (`wbc_bulk_seal`), then unwraps and opens it — a round-trip over
+   the SDK's only data-bearing path. There is no bulk-through-the-VM entry point.
 
 ### Honest note on "retrieving the key"
 
