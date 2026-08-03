@@ -200,6 +200,36 @@ a fresh terminal without them will fail.
 
 ### Configure and build
 
+**One command:** `./scripts/build_android.sh` wraps everything below — it validates
+the environment first (the failure modes here are opaque; a missing
+`OMVLL_PYTHONPATH` aborts thirty seconds into a compile with *"failed to get the
+Python codec of the filesystem encoding"*), defaults `OMVLL_CONFIG` /
+`OMVLL_PYTHONPATH` to their in-repo paths, and then **verifies the artifact**: that
+`libwbcrypto.so` really is ELF for the requested ABI, and that its dynamic symbol
+table exports only `wbc_*`.
+
+```sh
+./scripts/build_android.sh                   # obfuscated release, -> build-android/
+./scripts/build_android.sh --no-omvll        # obfuscation off
+./scripts/build_android.sh --target wb_bench # one target
+```
+
+It is a *wrapper*, not a second build system: CMake stays the single source of
+truth. Note the default output directory is **`build-android/`**, not `build/` —
+`build.sh` caches `libsodium.a` and skips rebuilding when the file is present, so
+sharing one directory between the host and cross builds means the next `./build.sh`
+silently links an ELF archive and fails with `undefined symbol: sodium_memzero`.
+Keep the two trees separate and neither needs an `rm -rf`.
+
+**Do not use `build.sh` for the ELF build.** It selects its `.so` link flags from
+`uname -s` — the *host* OS — so cross-compiling from macOS takes the Mach-O branch,
+feeds `-dead_strip`/`-exported_symbol` to an ELF linker, hits its
+"linker rejected the symbol-hygiene flags" fallback, and relinks **without the
+version script**. The result loads fine and exports `vm::*`, `wbaes::*` and
+`storage::*`. That is the exact regression the artifact check above exists to catch.
+
+The rest of this section is what the wrapper runs, for reference or manual use.
+
 `-DOMVLL=ON` fetches the pinned plugin (if absent) and adds `-fpass-plugin` to
 every target (plus `-Wl,-z,muldefs` — see fix for duplicate symbols below). To
 point at your own plugin build instead, set `-DOMVLL_PLUGIN="$PLUGIN"`. Pass the
