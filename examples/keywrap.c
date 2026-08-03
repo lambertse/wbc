@@ -24,7 +24,15 @@
 
 #include "wbcrypto.h"
 
-#define PAYLOAD_BYTES (1u << 20) /* 1 MiB */
+/* Payload size in MiB, settable from the command line so you can compare this
+ * directly against the same payload pushed through the VM:
+ *
+ *   ./build/keywrap 5
+ *   ./build/wb_bench --blob sealed.blob --pass demo --bulk-mb 5
+ *
+ * Same 5 MiB, same long-term key, two different code paths. */
+static size_t g_payload_bytes = 1u << 20; /* 1 MiB default */
+#define PAYLOAD_BYTES g_payload_bytes
 
 static double now_ms(void) {
     struct timespec ts;
@@ -38,7 +46,16 @@ static void print_hex(const char* label, const uint8_t* p, size_t n) {
     printf("\n");
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+    if (argc > 1) {
+        unsigned long mib = strtoul(argv[1], NULL, 10);
+        if (mib == 0 || mib > 4096) {
+            fprintf(stderr, "usage: %s [payload-MiB]   (1..4096, default 1)\n", argv[0]);
+            return 2;
+        }
+        g_payload_bytes = (size_t)mib << 20;
+    }
+
     const uint8_t long_term_key[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
                                        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f};
     const char* pass = "keywrap-demo";
@@ -61,7 +78,7 @@ int main(void) {
     if (!payload || !sealed || !opened) { fprintf(stderr, "oom\n"); return 1; }
     for (size_t i = 0; i < PAYLOAD_BYTES; ++i) payload[i] = (uint8_t)(i * 31u + 7u);
 
-    printf("payload: %u bytes\n\n", PAYLOAD_BYTES);
+    printf("payload: %zu bytes (%zu MiB)\n\n", PAYLOAD_BYTES, PAYLOAD_BYTES >> 20);
 
     /* ---- WRITE ---------------------------------------------------------- */
     double t0 = now_ms();
