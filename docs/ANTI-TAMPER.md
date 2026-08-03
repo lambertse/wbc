@@ -29,7 +29,18 @@ and the SDK glue. Enabled passes:
 - anti-hooking on the runtime/SDK TUs.
 
 Build via the NDK cross-compile in [BUILD.md](BUILD.md) (Option C). Benchmark
-`wbc_encrypt_block` after enabling CFF/MBA and pick a level you can afford.
+`wbc_encrypt_block` after enabling CFF/MBA and pick a level you can afford:
+
+```sh
+./scripts/bench_android.sh      # builds with/without the plugin, runs both on device
+```
+
+It reports the plugin's cost per surface, which is what tells you whether the
+hot/cold split in `omvll_config.py` is actually working — see
+[BUILD.md § Benchmarks](BUILD.md#benchmarks--what-does-o-mvll-actually-cost).
+Note that `wbc_open`'s cost is ~97% Argon2id, so the obfuscated loader there is
+reported as a bound rather than a value; the practical upshot is that heavy passes
+on the cold gate code are affordable.
 
 ## 2. Anti-DBI / anti-tamper — `src/rt/anti_tamper.*` (P3)
 
@@ -80,4 +91,6 @@ stub returning `false` (passphrase-only fallback) until then.
   clean dump.
 - Patching a byte in `.text` yields wrong ciphertext (integrity mixing active).
 - A blob provisioned on device A does not open on device B.
-- `wbc_encrypt_block` throughput stays within budget after CFF/MBA.
+- `wbc_encrypt_block` throughput stays within budget after CFF/MBA — measure with
+  `./scripts/bench_android.sh` (interleaved A/B on-device; also asserts the
+  obfuscated build produces identical ciphertext).

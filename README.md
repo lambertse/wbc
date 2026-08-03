@@ -132,6 +132,29 @@ A `CMakeLists.txt` is also provided for standard toolchains (mirrors the script;
   (flipping any blob byte or using a wrong passphrase fails to unseal); **salt
   uniqueness** (same key+passphrase sealed twice → different bytes, both open).
 
+## Performance
+
+`bench/wb_bench.cpp` measures the shipped runtime (interpreter, block/ECB/CTR
+encryption, blob open). The interesting question is what the O-MVLL native-code
+obfuscation costs, so `scripts/bench_android.sh` builds the benchmark **twice from
+identical sources** — plugin on and off — and runs both on a connected arm64 device,
+interleaved and CPU-pinned, then prints a per-surface ratio table:
+
+```sh
+./scripts/bench_android.sh                                    # on-device A/B
+./build/wb_bench --blob sealed.blob --pass demo                # host baseline
+./build/wb_bench --blob sealed.blob --pass demo --bulk-mb 5    # wall clock for a 5 MiB payload
+```
+
+`--bulk-mb N` answers "how long does an N MiB payload actually take?" — it encrypts,
+decrypts (`wbc_crypt_ctr`, the SDK's only decryption path) and verifies the round
+trip. Budget ~25 s per MiB per leg: the white-box is well under 1 MB/s, so push a
+*key* through it and move bulk data with conventional AES.
+
+It refuses to report timings for a build whose ciphertext changed, and reports a
+bound rather than a bogus number where a cost is smaller than the measurement noise.
+See [docs/BUILD.md § Benchmarks](docs/BUILD.md#benchmarks--what-does-o-mvll-actually-cost).
+
 ## Threat model & honest limitations
 
 This is a faithful, working artifact — not an unbreakable key vault. The

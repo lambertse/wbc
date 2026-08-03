@@ -35,8 +35,14 @@ if [ ${#CXXCMD[@]} -eq 0 ]; then
     echo "ERROR: no C++ compiler found (set ZIG_BIN or CXX)." >&2; exit 1
 fi
 # Archiver fallback if not already set by the zig path.
+# On macOS prefer Apple's /usr/bin/ar EXPLICITLY rather than letting a Homebrew
+# binutils/LLVM `ar` win on PATH: it must pair with Apple's `ld`, and a mismatch
+# surfaces much later, at link time, as an opaque archive error such as
+#   ld: archive member invalid control bits in '…/libsodium.a'
+# Set ZIG_BIN (or edit here) if you deliberately want a different archiver.
 if [ ${#ARCMD[@]} -eq 0 ]; then
-    if command -v llvm-ar >/dev/null 2>&1; then ARCMD=(llvm-ar)
+    if [ "$(uname -s)" = "Darwin" ] && [ -x /usr/bin/ar ]; then ARCMD=(/usr/bin/ar)
+    elif command -v llvm-ar >/dev/null 2>&1; then ARCMD=(llvm-ar)
     elif command -v ar >/dev/null 2>&1; then ARCMD=(ar)
     elif command -v zig >/dev/null 2>&1; then ARCMD=(zig ar); fi
 fi
@@ -47,7 +53,9 @@ elif [ -n "${CC:-}" ]; then CCCMD=("$CC")
 elif command -v cc >/dev/null 2>&1; then CCCMD=(cc)
 else CCCMD=("${CXXCMD[@]}"); fi
 
-BUILD=build
+# Output directory. Overridable so a second toolchain (or an A/B of compiler
+# flags) can build alongside an existing tree instead of clobbering it.
+BUILD="${BUILD_DIR:-build}"
 mkdir -p "$BUILD"
 
 # ---- vendored libsodium (seal KDF + AEAD) ----------------------------------
@@ -69,8 +77,13 @@ fi
 # visibility("default") in wbcrypto.h) and, via the version script below, the
 # public surface end up exported. -ffunction/data-sections lets --gc-sections
 # drop dead code from the shipped .so.
+# Optimization level. -O3 matches what the CMake/NDK path already gets from its
+# toolchain file, so host and device numbers are comparable; before this they
+# differed (-O2 here, -O3 there), which silently skewed any A/B. Overridable for
+# flag experiments: OPT_LEVEL=-O2 ./build.sh
+OPT_LEVEL="${OPT_LEVEL:--O3}"
 INCS=(-Isrc -Iinclude -Itests "-I$SODIUM_INC")
-CXXFLAGS=(-std=c++17 -O2 "${INCS[@]}" -Wall -Wextra -Wno-nullability-completeness
+CXXFLAGS=(-std=c++17 "$OPT_LEVEL" "${INCS[@]}" -Wall -Wextra -Wno-nullability-completeness
           -fvisibility=hidden -fvisibility-inlines-hidden
           -ffunction-sections -fdata-sections)
 
@@ -162,6 +175,16 @@ for t in "${TOOLS[@]}"; do
     name=$(basename "$t" .cpp); echo "build tool: $name"; build_bin "$name" "$t"
 done
 
+# Benchmark — a HOST (unobfuscated) baseline you can run immediately:
+#   ./scripts/gen_blob.sh && ./build/wb_bench --blob sealed.blob --pass demo
+# The O-MVLL on/off comparison is an arm64 Android device run; see
+# scripts/bench_android.sh and docs/BUILD.md ("Benchmarks").
+# NOTE: `./build.sh test` iterates only TESTS, so it does NOT run wb_bench. That
+# is intentional — a benchmark asserts nothing and would only slow the suite down.
+if [ -f bench/wb_bench.cpp ]; then
+    echo "build bench: wb_bench"; build_bin wb_bench bench/wb_bench.cpp
+fi
+
 # ---- SDK libraries ---------------------------------------------------------
 # libwbcrypto.{a,so} : shipped RUNTIME library (runtime objs + libsodium).
 # libwbprovision.a   : host-only PROVISIONING library (adds the keygen surface).
@@ -185,14 +208,38 @@ if [ ${#ARCMD[@]} -ne 0 ]; then
     PV_OBJS=();     while IFS= read -r __o; do PV_OBJS+=("$__o");     done < <(compile_objs pv "${PROVISION[@]}")
     SODIUM_OBJS=(); while IFS= read -r __o; do SODIUM_OBJS+=("$__o"); done < <(find "$BUILD/sodium" -name '*.o' | sort)
 
+    # Symbol-hygiene link flags. The GNU set below is ELF-only: Apple's ld64
+    # rejects it outright with
+    #   ld: unknown options: --gc-sections --build-id=none --strip-all --version-script=...
+    # so macOS needs the Mach-O equivalents. Same intent either way — export only
+    # wbc_*, drop dead code, keep internal symbols out of the table.
     VERSCRIPT="src/sdk/wbcrypto.map"
-    SO_LDFLAGS=(-Wl,--gc-sections -Wl,--build-id=none -Wl,--strip-all)
-    [ -f "$VERSCRIPT" ] && SO_LDFLAGS+=("-Wl,--version-script=$VERSCRIPT")
+    case "$(uname -s)" in
+        Darwin)
+            # ld64 has no version scripts; -exported_symbol takes globs, and C
+            # symbols carry a leading underscore in Mach-O. -x strips local symbols
+            # (there is no --strip-all), -dead_strip is --gc-sections.
+            SO_LDFLAGS=(-Wl,-dead_strip -Wl,-x "-Wl,-exported_symbol,_wbc_*")
+            ;;
+        *)
+            SO_LDFLAGS=(-Wl,--gc-sections -Wl,--build-id=none -Wl,--strip-all)
+            [ -f "$VERSCRIPT" ] && SO_LDFLAGS+=("-Wl,--version-script=$VERSCRIPT")
+            ;;
+    esac
 
     # Runtime shared library: runtime objs + only the libsodium objects actually
     # referenced (archive members are pulled in on demand).
-    "${CXXCMD[@]}" -shared -fPIC "${RT_OBJS[@]}" "$SODIUM_A" \
-        "${SO_LDFLAGS[@]}" ${EXTRA_LD_ARR[@]+"${EXTRA_LD_ARR[@]}"} -o "$BUILD/libwbcrypto.so"
+    # If the hygiene flags are not understood by this linker, retry without them:
+    # a host build that links is worth more than one that enforces symbol hiding,
+    # and the SHIPPED artifact is the CMake/NDK build, which is unaffected.
+    if ! "${CXXCMD[@]}" -shared -fPIC "${RT_OBJS[@]}" "$SODIUM_A" \
+            "${SO_LDFLAGS[@]}" ${EXTRA_LD_ARR[@]+"${EXTRA_LD_ARR[@]}"} \
+            -o "$BUILD/libwbcrypto.so" 2>/dev/null; then
+        echo "WARN: linker rejected the symbol-hygiene flags (${SO_LDFLAGS[*]});" >&2
+        echo "      relinking libwbcrypto.so without them — it will export more than wbc_*." >&2
+        "${CXXCMD[@]}" -shared -fPIC "${RT_OBJS[@]}" "$SODIUM_A" \
+            ${EXTRA_LD_ARR[@]+"${EXTRA_LD_ARR[@]}"} -o "$BUILD/libwbcrypto.so"
+    fi
 
     # Self-contained static archives (bundle the libsodium objects).
     rm -f "$BUILD/libwbcrypto.a" "$BUILD/libwbprovision.a"

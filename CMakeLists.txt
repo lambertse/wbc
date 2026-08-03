@@ -190,6 +190,15 @@ add_executable(wb_encrypt ${CMAKE_SOURCE_DIR}/src/tools/wb_encrypt.cpp)
 target_link_libraries(wb_encrypt PRIVATE wbcrypto_static)
 target_include_directories(wb_encrypt PRIVATE ${WBVM_INCLUDES})
 
+# Benchmark. Links the RUNTIME library only (same shape as wb_encrypt above), so
+# it measures what actually ships and can never time the provisioning surface.
+# Deliberately NOT registered with add_test(): it asserts nothing, so it has no
+# business in ctest. Drive the O-MVLL on/off comparison with
+# scripts/bench_android.sh; see docs/BUILD.md ("Benchmarks").
+add_executable(wb_bench ${CMAKE_SOURCE_DIR}/bench/wb_bench.cpp)
+target_link_libraries(wb_bench PRIVATE wbcrypto_static)
+target_include_directories(wb_bench PRIVATE ${WBVM_INCLUDES})
+
 # C integration example (full lifecycle -> links the provisioning library).
 add_executable(example ${CMAKE_SOURCE_DIR}/examples/example.c)
 target_link_libraries(example PRIVATE wbprovision)

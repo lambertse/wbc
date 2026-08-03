@@ -5,35 +5,15 @@
 
 namespace vm {
 
-uint8_t FetchByte(VMContext& ctx) {
-    const Program& p = *ctx.prog;
-    if (ctx.vip >= p.code.size()) {
-        ctx.halted = true;
-        return 0;
-    }
-    // Context-keyed decode: XOR with the current instruction's keystream, then
-    // fold the decoded byte so any tamper diverges the evolving key.
-    uint8_t ksb = static_cast<uint8_t>(ctx.ks.next() & 0xFF);
-    uint8_t b = static_cast<uint8_t>(p.code[ctx.vip] ^ ksb);
-    ctx.fold = fw::FoldByte(ctx.fold, b);
-    ++ctx.vip;
-    return b;
-}
-
-uint32_t FetchImm32(VMContext& ctx) {
-    uint32_t v = 0;
-    v |= static_cast<uint32_t>(FetchByte(ctx)) << 0;
-    v |= static_cast<uint32_t>(FetchByte(ctx)) << 8;
-    v |= static_cast<uint32_t>(FetchByte(ctx)) << 16;
-    v |= static_cast<uint32_t>(FetchByte(ctx)) << 24;
-    return v;
-}
+// FetchByte / FetchImm32 are header-inline in vm.h — see the comment there for
+// why (they are both the hot path and the single most useful hook point).
 
 std::array<uint8_t, 16> Run(const Program& prog, const std::array<uint8_t, 16>& in) {
     VMContext ctx;
     ctx.prog = &prog;
-    ctx.data = prog.data;            // private working copy of DATA memory
-    ctx.stack.reserve(64);
+    // Private working copy of DATA memory. Also the anti-DFA reset — see the
+    // note on Run() in vm.h before considering hoisting this out of the loop.
+    ctx.data = prog.data;
     ctx.vip = 0;
 
     // Bind decode to the interpreter fingerprint; seed the evolving key.

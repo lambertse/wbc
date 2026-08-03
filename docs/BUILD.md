@@ -394,6 +394,146 @@ release + build config), not merely the same major version. Use the clang from t
 **NDK the plugin was built for** (r29 for this repo's plugin), or **skip O-MVLL** —
 the project builds and passes all host tests without it.
 
+## Benchmarks — what does O-MVLL actually cost?
+
+[ANTI-TAMPER.md](ANTI-TAMPER.md) tells you to "benchmark `wbc_encrypt_block` after
+enabling CFF/MBA and pick a level you can afford", and lists throughput as an
+acceptance criterion. `bench/wb_bench.cpp` plus `scripts/bench_android.sh` are how
+you do that.
+
+One command builds `wb_bench` **twice from identical sources** — plugin on, plugin
+off — pushes both to a connected arm64 device along with **one** host-generated
+blob, runs them interleaved, and prints a ratio table:
+
+```sh
+# in the same shell you use for a normal obfuscated build (Option C env)
+./scripts/bench_android.sh
+```
+
+Useful flags: `--rounds N`, `--cooldown SEC`, `--cpu N`, `--blob FILE`,
+`--pass P`, `--reps N`, `--no-build`, `--serial S`.
+
+For a quick **host** baseline (no obfuscation — the plugin cannot load into a host
+compiler, see Option C):
+
+```sh
+./scripts/gen_blob.sh                                   # -> sealed.blob, pass "demo"
+./build.sh && ./build/wb_bench --blob sealed.blob --pass demo
+```
+
+`./build.sh test` does **not** run the benchmark: it asserts nothing, so it has no
+business in the test suite. It is likewise not registered with `ctest`.
+
+### What it measures, and why it is split up
+
+| metric | surface | O-MVLL passes applied there |
+|---|---|---|
+| `vm_run` | `vm::Run` — the interpreter | `break_control_flow` only (HOT tuple) |
+| `data_copy` | the per-block DATA image copy | none — plain allocation + memmove |
+| `encrypt_block` | `wbc_encrypt_block` | flatten + constants + struct-access + strings |
+| `encrypt_ecb_4k` | `wbc_encrypt_ecb`, 4 KiB | as above, amortized over 256 blocks |
+| `crypt_ctr_4k` | `wbc_crypt_ctr`, 4 KiB | as above |
+| `open` | `wbc_open` | flatten + **MBA** + constants + strings |
+| `kdf_argon2id` | `crypto_pwhash` alone | none — vendored libsodium |
+
+The splits exist because two large, **unobfuscated** costs sit inside the numbers
+you actually care about and drag their ratios towards a meaningless 1.00x:
+
+- `vm::Run` copies the whole DATA image (~400 KB) on **every** block
+  (`ctx.data = prog.data` in `src/vm/vm.cpp`). Measured separately as `data_copy`
+  so it can be subtracted. In practice it is only ~3% of `vm_run`, so `vm_run`
+  really is the interpreter's own cost — the metric is there to *prove* that.
+
+  This copy looks like obvious waste (only the trailing 48 bytes are ever
+  written) but **it is load-bearing**: restoring the read-only table bank before
+  each block is what washes out an injected fault before the next block can
+  observe it, i.e. the defence against differential fault analysis. Both ways of
+  removing it have been implemented and measured, and both were rejected:
+  reusing the buffer and *verifying* it per block instead is **~39% slower**
+  (streaming both images through cache evicts the table bank, so the next
+  block's ~3k scattered lookups miss to DRAM) *and* is a weaker guarantee;
+  reusing the buffer and still restoring saves only the allocation, which is
+  **not measurable**. Leave it alone.
+- `wbc_open` is ~97% Argon2id. Measured separately as `kdf_argon2id`.
+
+### "How long does my 5 MB payload take?" — `--bulk-mb`
+
+The metrics above are per-block *rates*. For an absolute wall-clock answer on a real
+payload, use `--bulk-mb N`, which encrypts N MiB, decrypts it back, and verifies the
+round trip:
+
+```sh
+./build/wb_bench --blob sealed.blob --pass demo --bulk-mb 5
+./scripts/bench_android.sh --bulk-mb 5          # same, on device, both builds
+```
+
+It is **off by default and it is slow** — the white-box runs at well under 1 MB/s,
+so budget roughly **25 s per MiB per leg** (measured on an arm64 dev host; ~2 min
+per leg for 5 MiB, and it does two legs). An ETA derived from the `crypt_ctr_4k`
+measurement is printed before it starts, so a multi-minute pass is not mistaken for
+a hang. Start with `--bulk-mb 1`.
+
+Two things worth knowing before you design around this:
+
+- **`wbc_crypt_ctr` is the only way to decrypt.** The white-box has no inverse
+  tables, so there is no decrypt primitive; CTR is its own inverse, which is what
+  gives you decryption at all. `wbc_encrypt_ecb` **cannot** decrypt.
+- **Decryption costs exactly the same as encryption** — both just generate keystream
+  and XOR. Both legs are timed so you can see that rather than take it on trust.
+
+If bulk throughput matters for your use case, the honest guidance is to encrypt a
+*key* with the white-box and move the bulk data with a conventional AES
+implementation, rather than pushing megabytes through the VM.
+
+Do not pass `--bulk-mb` to `bench_android.sh` casually: cost multiplies by two legs
+× two builds × `--rounds`. The obfuscation ratio the A/B exists to measure is already
+covered by `crypt_ctr_4k`.
+
+### Reading `open - kdf`
+
+This subtraction is **ill-conditioned** and the tooling will usually refuse to give
+you a number. The obfuscated loader in `trusted_storage.cpp` does a ~0.5 MB AEAD
+decrypt plus a header parse — well under a millisecond — inside a ~200 ms KDF whose
+own run-to-run variation is larger than that. So `wb_bench` reports a **bound**
+("NOT RESOLVABLE (< X ms)") unless the difference clears 2x the sampling spread.
+
+That bound is the useful answer: the flattened + MBA'd loader costs less than a few
+ms of a ~200 ms `wbc_open`, i.e. **heavy passes on the cold gate code are
+affordable** — exactly the bet `omvll_config.py` makes. More reps tighten the bound
+only slowly; a quiet, CPU-pinned device helps more.
+
+### Measurement hygiene (already handled by the script)
+
+- **Interleaved A/B** (`plain, omvll, plain, omvll`). Thermal drift over a session
+  is monotonic, so running all of one build then all of the other biases the ratio
+  by an unknown amount in favour of whichever ran first.
+- **One shared, host-generated blob**, so both builds execute byte-identical
+  bytecode. Never seal on device: `AssembleWhiteBox` is in `assembler.cpp`, which is
+  in `_MBA_MODULES`, so in-process sealing would itself diverge between builds.
+- **CPU pinning** to the highest-max-freq core via `taskset` (degrades gracefully),
+  because big.LITTLE migration mid-measurement dwarfs the effect being measured.
+- **Min-based statistics.** Under additive noise the minimum is the least
+  contaminated estimator, so ratios and subtractions use per-iteration minima.
+- **A correctness gate before any timing**, plus a `# ct=` line that
+  `bench_compare.sh` asserts is identical across builds. An obfuscation pass that
+  breaks the VM is a hard error, never a suspiciously good throughput number.
+
+### Adding another benchmark file — read this first
+
+`omvll_config.py` matches module names by **substring**:
+
+```python
+return any(s in n for s in _SENSITIVE_MODULES)   # tuple contains "vm.cpp"
+```
+
+So a harness named `bench_wbvm.cpp` matches `"vm.cpp"` (`...wb|vm.cpp|`), also
+satisfies `_is_hot`, and gets `break_control_flow` injected **into its own timing
+loop in the obfuscated build only**. (This is not hypothetical: `tests/test_vm.cpp`
+matches too, and is obfuscated today.) Keep harness filenames free of `vm.cpp`,
+`handlers.cpp`, `assembler.cpp`, `fwcrypt.cpp`, `fw_schedule`,
+`trusted_storage.cpp`, `wbcrypto.cpp` and `wbcrypto_provision.cpp` as substrings —
+`bench_android.sh` preflight-warns if `wb_bench.cpp` ever starts matching.
+
 ## Bootstrapping a compiler with Zig (no system compiler / no root)
 
 If the machine has no compiler and no `apt`/root access, a single self-contained

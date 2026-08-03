@@ -48,6 +48,33 @@ static void RunLevel(WBLevel level, const char* name, uint64_t wb_seed,
                 prog.code.size());
 }
 
+// vm::Run must carry NO state between blocks.
+//
+// This guards the per-block DATA copy, which is easy to mistake for dead weight
+// (only 48 of ~400 KB are ever written) but is also the reset that defeats
+// differential fault analysis: a fault injected into the table bank must not
+// survive into the next block. Any change that hoists the copy out of the
+// per-block path — a persistent arena, a shared table view — breaks that, and
+// this test is what should fail when it does. See the note on Run in vm/vm.h.
+static void TestStatelessness() {
+    Key128 key = test::FromHex<16>("000102030405060708090a0b0c0d0e0f");
+    auto wb = GenerateWhiteBox(key, 42, WBLevel::Internal);
+    vm::Program prog = vm::AssembleWhiteBox(*wb, 7, vm::ObfOptions::All());
+    Block fips_pt = test::FromHex<16>("00112233445566778899aabbccddeeff");
+
+    // Interleave other blocks around the reference vector: if any scratch (TMP,
+    // OUT, STATE) or table byte leaked across calls, the repeat would drift.
+    for (int i = 0; i < 4; ++i) {
+        Block noise = fips_pt;
+        noise[0] = static_cast<uint8_t>(0xA0 + i);
+        (void)vm::Run(prog, noise);
+
+        auto out = vm::Run(prog, fips_pt);
+        CHECK_EQ_HEX(out.data(), 16, "69c4e0d86a7b0430d8cdb78070b4c55a");
+    }
+    std::printf("  [state] Run is stateless across interleaved blocks\n");
+}
+
 int main() {
     Key128 fips = test::FromHex<16>("000102030405060708090a0b0c0d0e0f");
     // No obfuscation (bare bytecode) and full obfuscation must both be correct.
@@ -63,5 +90,7 @@ int main() {
         for (auto& b : rk) { kst = kst * 1664525u + 1013904223u; b = static_cast<uint8_t>(kst >> 24); }
         RunLevel(WBLevel::Internal, "internal-randkey", 300 + t, 400 + t, rk, false);
     }
+
+    TestStatelessness();
     return test::Report("test_vm");
 }

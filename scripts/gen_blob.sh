@@ -26,14 +26,30 @@ SODIUM_INC="$SODIUM_ROOT/src/libsodium/include"
 [ -f "$SODIUM_INC/sodium.h" ] || { echo "libsodium still missing — run ./third_party/fetch_deps.sh libsodium" >&2; exit 1; }
 
 # --- native host compiler (never ZIG_BIN, never EXTRA_CXXFLAGS) --------------
+# On macOS prefer the SYSTEM toolchain explicitly (/usr/bin/clang++ + /usr/bin/ar)
+# over whatever `c++`/`ar` resolve to on PATH. A Homebrew clang/binutils earlier on
+# PATH pairs a newer compiler with Apple's system `ld`, and the mismatch surfaces
+# only later, as an opaque archive/link error such as
+#   ld: archive member invalid control bits in 'build-host/libsodium.a'
+# Provisioning is host-only glue, so there is no reason to prefer a newer compiler
+# here. Override with HOST_CXX / HOST_AR if you really want a different one.
 CXX="${HOST_CXX:-}"
 if [ -z "$CXX" ]; then
-    for c in c++ clang++ g++; do command -v "$c" >/dev/null 2>&1 && CXX="$c" && break; done
+    if [ "$(uname -s)" = "Darwin" ] && [ -x /usr/bin/clang++ ]; then
+        CXX=/usr/bin/clang++
+    else
+        for c in c++ clang++ g++; do command -v "$c" >/dev/null 2>&1 && CXX="$c" && break; done
+    fi
 fi
 [ -n "$CXX" ] || { echo "no host C++ compiler found (set HOST_CXX)" >&2; exit 1; }
 AR="${HOST_AR:-}"
 if [ -z "$AR" ]; then
-    for a in ar llvm-ar; do command -v "$a" >/dev/null 2>&1 && AR="$a" && break; done
+    # Same reasoning as CXX above: pair Apple's ar with Apple's ld.
+    if [ "$(uname -s)" = "Darwin" ] && [ -x /usr/bin/ar ]; then
+        AR=/usr/bin/ar
+    else
+        for a in ar llvm-ar; do command -v "$a" >/dev/null 2>&1 && AR="$a" && break; done
+    fi
 fi
 [ -n "$AR" ] || { echo "no archiver found (set HOST_AR)" >&2; exit 1; }
 echo "host compiler: $CXX    archiver: $AR"
@@ -61,6 +77,31 @@ if [ ! -f "$SODIUM_A" ] || [ "$(cat "$STAMP" 2>/dev/null || true)" != "$WANT" ];
         sobjs+=("$o")
     done < <(find "$SODIUM_ROOT/src/libsodium" -name '*.c' | sort)
     "$AR" rcs "$SODIUM_A" "${sobjs[@]}"
+    # On macOS, sanity-check the archive FORMAT now rather than letting a bad one
+    # surface two steps later as an opaque linker error. Read the first member's
+    # 16-byte name field (at offset 8, right after the "!<arch>\n" magic): a
+    # BSD/Mach-O archive names its symbol table "__.SYMDEF" (or "__.SYMDEF SORTED"),
+    # a GNU one just "/". Apple's ld only understands the former, so a GNU/LLVM ar
+    # sneaking onto PATH is caught here instead of at link time.
+    # Scope note: this catches the wrong-archive-FORMAT case only. It does not catch
+    # a format-valid archive whose member objects the system ld still dislikes —
+    # that is what preferring /usr/bin/clang++ above is for.
+    # NOTE: do NOT try to detect this with `ar t` — ar omits the special members
+    # from its listing, so such a check silently never fires.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        first_member=$(dd if="$SODIUM_A" bs=1 skip=8 count=16 2>/dev/null || true)
+        case "$first_member" in
+            __.SYMDEF*) ;;  # BSD/Mach-O — good
+            *)
+                echo "ERROR: '$AR' produced a non-Mach-O archive ($SODIUM_A):" >&2
+                echo "       first member is '${first_member}', expected '__.SYMDEF'." >&2
+                echo "       Apple's ld cannot read it ('archive member invalid control" >&2
+                echo "       bits'). A GNU/LLVM ar is shadowing Apple's on PATH. Retry:" >&2
+                echo "         HOST_AR=/usr/bin/ar $0 $*" >&2
+                rm -f "$SODIUM_A" "$STAMP"
+                exit 1 ;;
+        esac
+    fi
     printf '%s' "$WANT" > "$STAMP"
 fi
 
