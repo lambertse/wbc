@@ -148,8 +148,34 @@ interleaved and CPU-pinned, then prints a per-surface ratio table:
 
 `--bulk-mb N` answers "how long does an N MiB payload actually take?" — it encrypts,
 decrypts (`wbc_crypt_ctr`, the SDK's only decryption path) and verifies the round
-trip. Budget ~25 s per MiB per leg: the white-box is well under 1 MB/s, so push a
-*key* through it and move bulk data with conventional AES.
+trip. Budget ~20 s per MiB per leg.
+
+### Don't push bulk data through the white-box — wrap a key
+
+The white-box runs well under 1 MB/s because every 16-byte block is ~13k obfuscated
+VM instructions. That slowness *is* the obfuscation, so the fix is not to make the VM
+faster but to give it less to do: protect a **key** with the white-box and move the
+**data** with a conventional AEAD.
+
+```c
+uint8_t sk[WBC_SESSION_KEY_BYTES];
+wbc_random(sk, sizeof sk);                       /* fresh session key       */
+wbc_crypt_ctr(ctx, iv, sk, wrapped, sizeof sk);  /* white-box wraps it      */
+wbc_bulk_seal(sk, data, n, out, &out_n);         /* AEAD moves the payload  */
+wbc_wipe(sk, sizeof sk);                         /* drop the plaintext key  */
+```
+
+Store `iv || wrapped` next to the ciphertext; unwrap with the same `wbc_crypt_ctr`
+call (CTR is its own inverse) and `wbc_bulk_open`. `examples/keywrap.c` is a runnable
+version that times both paths — on a 1 MiB payload it round-trips in **~3 ms versus
+~23 s** straight through the VM, roughly **7,500×**, protecting the same long-term key.
+
+**What this does and does not protect:** the white-box protects the long-term key —
+that key is never reconstructed. It does **not** extend that guarantee to the session
+key or the bulk data. Between the unwrap and the `wbc_wipe`, `sk` is an ordinary key
+in ordinary memory, and an attacker who can dump the process gets it without touching
+the white-box. That is a deliberate trade of coverage for throughput: keep the
+plaintext session key's lifetime short and prefer a fresh key per message.
 
 It refuses to report timings for a build whose ciphertext changed, and reports a
 bound rather than a bogus number where a cost is smaller than the measurement noise.

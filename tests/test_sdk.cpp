@@ -2,6 +2,7 @@
 // CTR round-trip, aliasing, and error paths. Included from C++ but uses only
 // the extern "C" surface a native integrator would see.
 #include <cstring>
+#include <vector>
 
 #include "test_util.h"
 #include "wbaes/aes_ref.h"   // oracle for cross-check
@@ -97,6 +98,66 @@ int main() {
         wbc_ctx* ectx = nullptr;
         CHECK(wbc_open(nblob, nlen, "", &ectx) == WBC_OK);
         wbc_close(nctx); wbc_close(ectx); wbc_free(nblob);
+    }
+
+    // ---- key wrapping: the documented pattern for real payloads ------------
+    // The white-box wraps a session key; a conventional AEAD moves the data.
+    {
+        uint8_t sk[WBC_SESSION_KEY_BYTES], sk_unwrapped[WBC_SESSION_KEY_BYTES];
+        uint8_t wrapped[WBC_SESSION_KEY_BYTES], iv[WBC_BLOCK_BYTES];
+        CHECK(wbc_random(sk, sizeof sk) == WBC_OK);
+        CHECK(wbc_random(iv, sizeof iv) == WBC_OK);
+
+        // wrap, then unwrap with the same call (CTR is its own inverse).
+        CHECK(wbc_crypt_ctr(ctx, iv, sk, wrapped, sizeof sk) == WBC_OK);
+        CHECK(std::memcmp(sk, wrapped, sizeof sk) != 0);  // it really was encrypted
+        CHECK(wbc_crypt_ctr(ctx, iv, wrapped, sk_unwrapped, sizeof sk) == WBC_OK);
+        CHECK(std::memcmp(sk, sk_unwrapped, sizeof sk) == 0);
+
+        // Bulk round-trip, including a 0-length payload and an odd length.
+        for (size_t n : {size_t{0}, size_t{1}, size_t{4095}}) {
+            std::vector<uint8_t> in(n), sealed(n + WBC_BULK_OVERHEAD), opened(n ? n : 1);
+            for (size_t i = 0; i < n; ++i) in[i] = static_cast<uint8_t>(i * 7 + 3);
+            size_t sealed_len = 0, opened_len = 0;
+            CHECK(wbc_bulk_seal(sk, in.data(), n, sealed.data(), &sealed_len) == WBC_OK);
+            CHECK(sealed_len == n + WBC_BULK_OVERHEAD);
+            CHECK(wbc_bulk_open(sk, sealed.data(), sealed_len, opened.data(),
+                                &opened_len) == WBC_OK);
+            CHECK(opened_len == n);
+            CHECK(n == 0 || std::memcmp(in.data(), opened.data(), n) == 0);
+
+            // Any single-bit change anywhere must fail authentication, and a
+            // wrong key must not decrypt.
+            sealed[sealed_len / 2] ^= 0x01;
+            CHECK(wbc_bulk_open(sk, sealed.data(), sealed_len, opened.data(),
+                                &opened_len) == WBC_ERR_AUTH);
+            sealed[sealed_len / 2] ^= 0x01;
+            uint8_t wrong[WBC_SESSION_KEY_BYTES];
+            std::memcpy(wrong, sk, sizeof wrong);
+            wrong[0] ^= 0x80;
+            CHECK(wbc_bulk_open(wrong, sealed.data(), sealed_len, opened.data(),
+                                &opened_len) == WBC_ERR_AUTH);
+        }
+
+        // Two seals of the same plaintext must differ (fresh random nonce).
+        uint8_t a[WBC_BULK_OVERHEAD + 8], b[WBC_BULK_OVERHEAD + 8];
+        const uint8_t msg[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        size_t alen = 0, blen2 = 0;
+        CHECK(wbc_bulk_seal(sk, msg, sizeof msg, a, &alen) == WBC_OK);
+        CHECK(wbc_bulk_seal(sk, msg, sizeof msg, b, &blen2) == WBC_OK);
+        CHECK(alen == blen2 && std::memcmp(a, b, alen) != 0);
+
+        // wbc_wipe actually clears.
+        wbc_wipe(sk, sizeof sk);
+        bool all_zero = true;
+        for (unsigned char c : sk) all_zero = all_zero && (c == 0);
+        CHECK(all_zero);
+
+        // error paths on the bulk surface.
+        size_t dummy = 0;
+        CHECK(wbc_bulk_open(sk, a, WBC_BULK_OVERHEAD - 1, b, &dummy) == WBC_ERR_ARG);
+        CHECK(wbc_bulk_seal(nullptr, msg, sizeof msg, a, &dummy) == WBC_ERR_ARG);
+        CHECK(wbc_random(nullptr, 4) == WBC_ERR_ARG);
     }
 
     // error paths.

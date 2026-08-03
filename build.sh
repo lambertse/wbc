@@ -251,11 +251,13 @@ if [ ${#ARCMD[@]} -ne 0 ]; then
     # run), so it links the host PROVISIONING archive (libwbprovision.a, which
     # also contains the runtime). A real field app links only libwbcrypto.so and
     # never calls wbc_seal_key. Linked with the C++ driver so libc++ resolves.
-    if [ -f examples/example.c ]; then
-        echo "build example: example (C, links libwbprovision.a)"
-        "${CXXCMD[@]}" -Iinclude ${EXTRA_C_ARR[@]+"${EXTRA_C_ARR[@]}"} examples/example.c \
-            "$BUILD/libwbprovision.a" ${EXTRA_LD_ARR[@]+"${EXTRA_LD_ARR[@]}"} -o "$BUILD/example"
-    fi
+    for ex in examples/*.c; do
+        [ -f "$ex" ] || continue
+        exname=$(basename "$ex" .c)
+        echo "build example: $exname (C, links libwbprovision.a)"
+        "${CXXCMD[@]}" -Iinclude ${EXTRA_C_ARR[@]+"${EXTRA_C_ARR[@]}"} "$ex" \
+            "$BUILD/libwbprovision.a" ${EXTRA_LD_ARR[@]+"${EXTRA_LD_ARR[@]}"} -o "$BUILD/$exname"
+    done
 else
     echo "WARN: no archiver found; skipping static/shared library build" >&2
 fi

@@ -481,9 +481,13 @@ Two things worth knowing before you design around this:
 - **Decryption costs exactly the same as encryption** — both just generate keystream
   and XOR. Both legs are timed so you can see that rather than take it on trust.
 
-If bulk throughput matters for your use case, the honest guidance is to encrypt a
-*key* with the white-box and move the bulk data with a conventional AES
-implementation, rather than pushing megabytes through the VM.
+If bulk throughput matters for your use case, do not push megabytes through the VM —
+wrap a key instead. The SDK ships the pieces (`wbc_random`, `wbc_bulk_seal`,
+`wbc_bulk_open`, `wbc_wipe`) and `examples/keywrap.c` is a runnable end-to-end
+version that times both paths; on a 1 MiB payload it round-trips in ~3 ms against
+~23 s straight through the VM. See the README's Performance section for the pattern
+and for what it does and does not protect (the session key is plaintext in memory
+for its lifetime).
 
 Do not pass `--bulk-mb` to `bench_android.sh` casually: cost multiplies by two legs
 × two builds × `--rounds`. The obfuscation ratio the A/B exists to measure is already

@@ -37,11 +37,18 @@ extern "C" {
 #define WBC_KEY_BYTES   16
 #define WBC_BLOCK_BYTES 16
 
+/* Session key for the bulk helpers below (XChaCha20-Poly1305). */
+#define WBC_SESSION_KEY_BYTES 32
+/* Bytes wbc_bulk_seal adds to the plaintext: 24-byte nonce + 16-byte tag. */
+#define WBC_BULK_OVERHEAD 40
+
 typedef enum wbc_status {
     WBC_OK         =  0,
     WBC_ERR_ARG    = -1,  /* NULL/invalid argument or bad length          */
     WBC_ERR_FORMAT = -2,  /* malformed / truncated blob                   */
-    WBC_ERR_NOMEM  = -3   /* allocation failed                            */
+    WBC_ERR_NOMEM  = -3,  /* allocation failed                            */
+    WBC_ERR_AUTH   = -4   /* AEAD authentication failed (wrong key, or
+                           * the ciphertext was modified)                 */
 } wbc_status;
 
 /* Opaque handle around a loaded, sealed white-box program. */
@@ -90,6 +97,53 @@ WBC_API wbc_status wbc_encrypt_ecb(wbc_ctx* ctx, const uint8_t* in,
  * white-box itself only encrypts. `in`/`out` may alias. */
 WBC_API wbc_status wbc_crypt_ctr(wbc_ctx* ctx, const uint8_t iv[WBC_BLOCK_BYTES],
                                  const uint8_t* in, uint8_t* out, size_t len);
+
+/* ---- Bulk data: key wrapping ---------------------------------------------
+ *
+ * THE WHITE-BOX IS SLOW ON PURPOSE. It runs well under 1 MB/s (budget ~25 s per
+ * MiB per leg), because every 16-byte block is ~13k obfuscated VM instructions.
+ * Pushing megabytes through wbc_crypt_ctr is therefore the wrong shape. The
+ * right shape is to protect a *key* with the white-box and move the *data* with
+ * a conventional cipher:
+ *
+ *   wbc_random(sk, WBC_SESSION_KEY_BYTES);        // fresh session key
+ *   wbc_crypt_ctr(ctx, iv, sk, wrapped, 32);      // white-box wraps it (2 blocks)
+ *   wbc_bulk_seal(sk, data, n, out, &out_n);      // conventional AEAD moves data
+ *   wbc_wipe(sk, sizeof sk);                      // drop the plaintext key
+ *
+ * Store `wrapped` alongside the ciphertext. To read it back, unwrap with the
+ * same wbc_crypt_ctr call (CTR is its own inverse) and wbc_bulk_open.
+ *
+ * WHAT THIS DOES AND DOES NOT PROTECT. The white-box protects the LONG-TERM key
+ * -- that key is never reconstructed in memory. It does NOT extend that
+ * guarantee to the session key or the bulk data: between wbc_crypt_ctr and
+ * wbc_wipe, `sk` is an ordinary key in ordinary memory, and an attacker who can
+ * dump the process gets it without attacking the white-box at all. This is a
+ * deliberate trade of white-box coverage for throughput. Keep the plaintext
+ * session key's lifetime as short as you can, prefer a fresh key per message
+ * over a long-lived one, and always wbc_wipe it.
+ */
+
+/* Fill `buf` with cryptographically secure random bytes. */
+WBC_API wbc_status wbc_random(uint8_t* buf, size_t len);
+
+/* Best-effort erase of sensitive memory; not optimized away by the compiler. */
+WBC_API void wbc_wipe(void* p, size_t len);
+
+/* Encrypt+authenticate `len` bytes under a session key (XChaCha20-Poly1305).
+ * `out` must have room for len + WBC_BULK_OVERHEAD bytes; the nonce is chosen
+ * randomly and prepended, so callers never manage nonces. *out_len receives the
+ * bytes written. `in` and `out` must NOT overlap. */
+WBC_API wbc_status wbc_bulk_seal(const uint8_t key[WBC_SESSION_KEY_BYTES],
+                                 const uint8_t* in, size_t len,
+                                 uint8_t* out, size_t* out_len);
+
+/* Inverse of wbc_bulk_seal. `len` is the sealed length (>= WBC_BULK_OVERHEAD);
+ * `out` needs len - WBC_BULK_OVERHEAD bytes. Returns WBC_ERR_AUTH if the data
+ * or key is wrong -- on failure nothing is written. `in`/`out` must NOT overlap. */
+WBC_API wbc_status wbc_bulk_open(const uint8_t key[WBC_SESSION_KEY_BYTES],
+                                 const uint8_t* in, size_t len,
+                                 uint8_t* out, size_t* out_len);
 
 /* Release a context. */
 WBC_API void wbc_close(wbc_ctx* ctx);

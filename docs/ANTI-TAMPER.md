@@ -84,6 +84,36 @@ that accepts extra key material; the current C ABI is intentionally left raw
 until the JNI bridge and on-device validation exist. `DeviceKeyMaterial` is a
 stub returning `false` (passphrase-only fallback) until then.
 
+## 4. Key wrapping — what leaves the white-box's protection
+
+The throughput guidance in the README (wrap a session key with the white-box, move
+bulk data with a conventional AEAD via `wbc_bulk_seal`/`wbc_bulk_open`) is a
+deliberate reduction in coverage, and it belongs in the threat model rather than
+only in the performance notes.
+
+**Protected:** the long-term AES key. It is never reconstructed in memory — that is
+the whole point of the construction and key wrapping does not weaken it.
+
+**Not protected:** the session key and the bulk data. Between `wbc_crypt_ctr`
+returning the unwrapped key and `wbc_wipe` clearing it, the session key is an
+ordinary key in ordinary process memory. An attacker with a memory dump, a debugger,
+or a Frida hook on the caller gets it *without attacking the white-box at all* — the
+VM's obfuscation, the context-keyed decode and the per-block DFA reset are all
+irrelevant to that path.
+
+The trade is worth making because the alternative is ~20 s per MiB per leg, but be
+explicit about what you are buying:
+
+- Prefer a **fresh session key per message**, so one recovered key exposes one
+  message rather than the archive.
+- Keep the plaintext key's lifetime as short as possible; `wbc_wipe` it the moment
+  the payload is sealed or opened.
+- Consider `sodium_mlock`-style page pinning for the buffer if your platform
+  supports it, so the key cannot reach swap or a core dump.
+- If an attacker with live process access is genuinely in scope, key wrapping does
+  not defend against them — nothing in this SDK does. It raises the bar against
+  static analysis and file-level theft, which is the stated goal.
+
 ## Acceptance (run on the NDK + device build)
 
 - `strings libwbcrypto.so` reveals neither `WBTS` nor the PRNG/FNV constants.
@@ -94,3 +124,5 @@ stub returning `false` (passphrase-only fallback) until then.
 - `wbc_encrypt_block` throughput stays within budget after CFF/MBA — measure with
   `./scripts/bench_android.sh` (interleaved A/B on-device; also asserts the
   obfuscated build produces identical ciphertext).
+- Anything moving more than a few hundred bytes uses the key-wrapping pattern
+  (§4), not `wbc_crypt_ctr` over the payload, and `wbc_wipe`s the session key.

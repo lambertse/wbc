@@ -12,6 +12,8 @@
 #define WBC_BUILD
 #include "wbcrypto.h"
 
+#include <sodium.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -33,6 +35,7 @@ const char* wbc_strerror(wbc_status s) {
         case WBC_ERR_ARG: return "invalid argument";
         case WBC_ERR_FORMAT: return "malformed blob";
         case WBC_ERR_NOMEM: return "out of memory";
+        case WBC_ERR_AUTH: return "authentication failed";
     }
     return "unknown";
 }
@@ -107,6 +110,77 @@ wbc_status wbc_crypt_ctr(wbc_ctx* ctx, const uint8_t iv[WBC_BLOCK_BYTES],
     } catch (...) {
         return WBC_ERR_NOMEM;
     }
+}
+
+/* ---- Bulk data helpers ---------------------------------------------------
+ *
+ * These are conventional XChaCha20-Poly1305, NOT white-box protected. They
+ * exist so callers stop pushing megabytes through the VM at 0.045 MB/s: the
+ * white-box wraps a session key, these move the payload. See the contract and
+ * the memory-exposure caveat in wbcrypto.h.
+ *
+ * Sizes are checked against the libsodium constants with static_assert rather
+ * than assumed, so a libsodium upgrade that changed them is a build error
+ * instead of a buffer overflow.
+ */
+static_assert(WBC_SESSION_KEY_BYTES == crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+              "WBC_SESSION_KEY_BYTES must track libsodium's KEYBYTES");
+static_assert(WBC_BULK_OVERHEAD == crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
+                                       crypto_aead_xchacha20poly1305_ietf_ABYTES,
+              "WBC_BULK_OVERHEAD must track libsodium's NPUBBYTES + ABYTES");
+
+namespace {
+constexpr size_t kNonce = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;  // 24
+
+/* sodium_init() is idempotent; <0 means the RNG is unusable. */
+bool EnsureSodium() { return sodium_init() >= 0; }
+}  // namespace
+
+wbc_status wbc_random(uint8_t* buf, size_t len) {
+    if (!buf && len) return WBC_ERR_ARG;
+    if (!EnsureSodium()) return WBC_ERR_NOMEM;
+    if (len) randombytes_buf(buf, len);
+    return WBC_OK;
+}
+
+void wbc_wipe(void* p, size_t len) {
+    if (p && len) sodium_memzero(p, len);
+}
+
+wbc_status wbc_bulk_seal(const uint8_t key[WBC_SESSION_KEY_BYTES], const uint8_t* in,
+                         size_t len, uint8_t* out, size_t* out_len) {
+    if (!key || !out || !out_len || (!in && len)) return WBC_ERR_ARG;
+    if (len > SIZE_MAX - WBC_BULK_OVERHEAD) return WBC_ERR_ARG;
+    if (!EnsureSodium()) return WBC_ERR_NOMEM;
+
+    /* Random nonce, prepended, so callers never have to manage one. At 24 bytes
+     * random selection is safe for any realistic number of messages. */
+    randombytes_buf(out, kNonce);
+    unsigned long long ct_len = 0;
+    if (crypto_aead_xchacha20poly1305_ietf_encrypt(out + kNonce, &ct_len, in, len,
+                                                   nullptr, 0, nullptr, out,
+                                                   key) != 0)
+        return WBC_ERR_NOMEM;
+    *out_len = kNonce + static_cast<size_t>(ct_len);
+    return WBC_OK;
+}
+
+wbc_status wbc_bulk_open(const uint8_t key[WBC_SESSION_KEY_BYTES], const uint8_t* in,
+                         size_t len, uint8_t* out, size_t* out_len) {
+    if (!key || !in || !out_len) return WBC_ERR_ARG;
+    if (len < WBC_BULK_OVERHEAD) return WBC_ERR_ARG;
+    if (!out && len > WBC_BULK_OVERHEAD) return WBC_ERR_ARG;
+    if (!EnsureSodium()) return WBC_ERR_NOMEM;
+
+    unsigned long long pt_len = 0;
+    /* Verifies the tag before releasing any plaintext, so a forgery writes
+     * nothing to `out`. */
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(out, &pt_len, nullptr,
+                                                   in + kNonce, len - kNonce,
+                                                   nullptr, 0, in, key) != 0)
+        return WBC_ERR_AUTH;
+    *out_len = static_cast<size_t>(pt_len);
+    return WBC_OK;
 }
 
 void wbc_close(wbc_ctx* ctx) { delete ctx; }

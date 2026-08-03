@@ -199,10 +199,17 @@ add_executable(wb_bench ${CMAKE_SOURCE_DIR}/bench/wb_bench.cpp)
 target_link_libraries(wb_bench PRIVATE wbcrypto_static)
 target_include_directories(wb_bench PRIVATE ${WBVM_INCLUDES})
 
-# C integration example (full lifecycle -> links the provisioning library).
-add_executable(example ${CMAKE_SOURCE_DIR}/examples/example.c)
-target_link_libraries(example PRIVATE wbprovision)
-set_target_properties(example PROPERTIES LINKER_LANGUAGE CXX)
+# C integration examples (full lifecycle -> link the provisioning library).
+#   example  — the basic open/encrypt lifecycle
+#   keywrap  — the pattern to use for real payloads: the white-box wraps a
+#              session key, a conventional AEAD moves the data
+file(GLOB WBVM_EXAMPLES ${CMAKE_SOURCE_DIR}/examples/*.c)
+foreach(ex ${WBVM_EXAMPLES})
+    get_filename_component(exname ${ex} NAME_WE)
+    add_executable(${exname} ${ex})
+    target_link_libraries(${exname} PRIVATE wbprovision)
+    set_target_properties(${exname} PROPERTIES LINKER_LANGUAGE CXX)
+endforeach()
 
 # Tests (link the full source set).
 enable_testing()
