@@ -3,7 +3,7 @@
 # automatically at configure time by third_party/fetch_deps.sh. Usage:
 #   cmake -S . -B build && cmake --build build && ctest --test-dir build
 cmake_minimum_required(VERSION 3.16)
-# C is enabled because the SDK integration example (examples/example.c) is C and
+# C is enabled because the SDK integration example (examples/keywrap.c) is C and
 # libsodium (the seal's KDF/AEAD dependency) is C.
 project(whitebox_crypto_vm C CXX)
 
@@ -209,10 +209,9 @@ add_executable(wb_ladder ${CMAKE_SOURCE_DIR}/bench/wb_ladder.cpp)
 target_link_libraries(wb_ladder PRIVATE wbprovision)
 target_include_directories(wb_ladder PRIVATE ${WBVM_INCLUDES} ${CMAKE_SOURCE_DIR}/bench)
 
-# C integration examples (full lifecycle -> link the provisioning library).
-#   example  — the basic open/encrypt lifecycle
-#   keywrap  — the pattern to use for real payloads: the white-box wraps a
-#              session key, a conventional AEAD moves the data
+# C integration example (full lifecycle -> links the provisioning library).
+#   keywrap — the SDK's only shape: the white-box wraps a session key, a
+#             conventional AEAD moves the data.
 file(GLOB WBVM_EXAMPLES ${CMAKE_SOURCE_DIR}/examples/*.c)
 foreach(ex ${WBVM_EXAMPLES})
     get_filename_component(exname ${ex} NAME_WE)

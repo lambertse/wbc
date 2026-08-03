@@ -94,7 +94,7 @@ only in the performance notes.
 **Protected:** the long-term AES key. It is never reconstructed in memory — that is
 the whole point of the construction and key wrapping does not weaken it.
 
-**Not protected:** the session key and the bulk data. Between `wbc_crypt_ctr`
+**Not protected:** the session key and the bulk data. Between `wbc_unwrap_key`
 returning the unwrapped key and `wbc_wipe` clearing it, the session key is an
 ordinary key in ordinary process memory. An attacker with a memory dump, a debugger,
 or a Frida hook on the caller gets it *without attacking the white-box at all* — the
@@ -124,5 +124,6 @@ explicit about what you are buying:
 - `wbc_encrypt_block` throughput stays within budget after CFF/MBA — measure with
   `./scripts/bench_android.sh` (interleaved A/B on-device; also asserts the
   obfuscated build produces identical ciphertext).
-- Anything moving more than a few hundred bytes uses the key-wrapping pattern
-  (§4), not `wbc_crypt_ctr` over the payload, and `wbc_wipe`s the session key.
+- The session key is `wbc_wipe`d as soon as the payload is sealed or opened. (The
+  "don't push bulk through the VM" half of this is now enforced by the API rather
+  than asked of the reader: as of 2.0.0 there is no bulk entry point to misuse.)

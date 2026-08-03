@@ -143,32 +143,36 @@ interleaved and CPU-pinned, then prints a per-surface ratio table:
 ```sh
 ./scripts/bench_android.sh                                    # on-device A/B
 ./build/wb_bench --blob sealed.blob --pass demo                # host baseline
-./build/wb_bench --blob sealed.blob --pass demo --bulk-mb 5    # wall clock for a 5 MiB payload
+./build/keywrap 5                                              # end-to-end, 5 MiB
 ```
 
-`--bulk-mb N` answers "how long does an N MiB payload actually take?" — it encrypts,
-decrypts (`wbc_crypt_ctr`, the SDK's only decryption path) and verifies the round
-trip. Budget ~20 s per MiB per leg.
+### One road: wrap a key, don't push data through the white-box
 
-### Don't push bulk data through the white-box — wrap a key
-
-The white-box runs well under 1 MB/s because every 16-byte block is ~13k obfuscated
-VM instructions. That slowness *is* the obfuscation, so the fix is not to make the VM
-faster but to give it less to do: protect a **key** with the white-box and move the
-**data** with a conventional AEAD.
+The white-box runs well under 1 MB/s because every 16-byte block is thousands of
+obfuscated VM instructions. That slowness **is** the obfuscation — it cannot be
+optimized away without deleting the protection. So the SDK deliberately offers **no
+bulk entry point** (`wbc_encrypt_ecb` and `wbc_crypt_ctr` were removed in 2.0.0).
+Protect a **key** with the white-box and move the **data** with a conventional AEAD:
 
 ```c
-uint8_t sk[WBC_SESSION_KEY_BYTES];
-wbc_random(sk, sizeof sk);                       /* fresh session key       */
-wbc_crypt_ctr(ctx, iv, sk, wrapped, sizeof sk);  /* white-box wraps it      */
-wbc_bulk_seal(sk, data, n, out, &out_n);         /* AEAD moves the payload  */
-wbc_wipe(sk, sizeof sk);                         /* drop the plaintext key  */
+uint8_t sk[WBC_SESSION_KEY_BYTES], wrapped[WBC_WRAPPED_KEY_BYTES];
+wbc_random(sk, sizeof sk);                 /* fresh session key            */
+wbc_wrap_key(ctx, sk, wrapped);            /* white-box wraps it, 2 blocks */
+wbc_bulk_seal(sk, data, n, out, &out_n);   /* AEAD moves the payload       */
+wbc_wipe(sk, sizeof sk);                   /* drop the plaintext key       */
 ```
 
-Store `iv || wrapped` next to the ciphertext; unwrap with the same `wbc_crypt_ctr`
-call (CTR is its own inverse) and `wbc_bulk_open`. `examples/keywrap.c` is a runnable
-version that times both paths — on a 1 MiB payload it round-trips in **~3 ms versus
-~23 s** straight through the VM, roughly **7,500×**, protecting the same long-term key.
+Store `wrapped` next to the sealed payload — it carries its own IV, generated inside
+`wbc_wrap_key` so it cannot be reused. To read back: `wbc_unwrap_key` then
+`wbc_bulk_open`. `examples/keywrap.c` is the runnable version.
+
+**The white-box charge is fixed at two blocks per wrap** — it does not grow with the
+payload, so only the AEAD term scales. Measured: a 5 MiB round trip is **~13 ms per
+leg**, against ~85 s if the payload itself went through the VM.
+
+The wrap is not separately authenticated: a corrupted `wrapped` unwraps to a wrong
+session key and `wbc_bulk_open` then fails its tag with `WBC_ERR_AUTH`, so corruption
+is caught where it matters without a second MAC.
 
 **What this does and does not protect:** the white-box protects the long-term key —
 that key is never reconstructed. It does **not** extend that guarantee to the session

@@ -27,7 +27,9 @@ struct wbc_ctx {
 
 extern "C" {
 
-const char* wbc_version(void) { return "1.0.0"; }
+/* 2.0.0: the bulk entry points (wbc_encrypt_ecb, wbc_crypt_ctr) were removed in
+ * favour of wbc_wrap_key/wbc_unwrap_key. Breaking ABI change, hence the major. */
+const char* wbc_version(void) { return "2.0.0"; }
 
 const char* wbc_strerror(wbc_status s) {
     switch (s) {
@@ -78,34 +80,74 @@ wbc_status wbc_encrypt_block(wbc_ctx* ctx, const uint8_t in[WBC_BLOCK_BYTES],
     }
 }
 
-wbc_status wbc_encrypt_ecb(wbc_ctx* ctx, const uint8_t* in, uint8_t* out,
-                           size_t len) {
-    if (!ctx || !in || !out) return WBC_ERR_ARG;
-    if (len % 16 != 0) return WBC_ERR_ARG;
-    for (size_t off = 0; off < len; off += 16) {
-        wbc_status s = wbc_encrypt_block(ctx, in + off, out + off);
-        if (s != WBC_OK) return s;
+/* ---- The one road: key wrapping ------------------------------------------
+ *
+ * There is deliberately no bulk-through-the-VM entry point. CTR over exactly
+ * WBC_SESSION_KEY_BYTES is the ONLY use of the block cipher as a stream cipher,
+ * and the length is a compile-time constant here rather than a caller argument,
+ * so the "push a megabyte through the white-box" shape is not expressible.
+ *
+ * Shared by wrap and unwrap: CTR is its own inverse, so both directions are the
+ * same keystream XOR. `iv` is the initial counter block.
+ */
+/* Sizes are checked against the libsodium constants with static_assert rather
+ * than assumed, so a libsodium upgrade that changed them is a build error
+ * instead of a buffer overflow. */
+static_assert(WBC_SESSION_KEY_BYTES == crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+              "WBC_SESSION_KEY_BYTES must track libsodium's KEYBYTES");
+static_assert(WBC_BULK_OVERHEAD == crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
+                                       crypto_aead_xchacha20poly1305_ietf_ABYTES,
+              "WBC_BULK_OVERHEAD must track libsodium's NPUBBYTES + ABYTES");
+static_assert(WBC_WRAPPED_KEY_BYTES == WBC_BLOCK_BYTES + WBC_SESSION_KEY_BYTES,
+              "WBC_WRAPPED_KEY_BYTES is the IV plus the wrapped key");
+
+namespace {
+constexpr size_t kNonce = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;  // 24
+
+/* sodium_init() is idempotent; <0 means the RNG is unusable. */
+bool EnsureSodium() { return sodium_init() >= 0; }
+
+void CtrSessionKey(const vm::Program& prog, const uint8_t iv[WBC_BLOCK_BYTES],
+                   const uint8_t* in, uint8_t* out) {
+    std::array<uint8_t, 16> counter{};
+    std::memcpy(counter.data(), iv, 16);
+    for (size_t off = 0; off < WBC_SESSION_KEY_BYTES; off += 16) {
+        auto ks = vm::Run(prog, counter);  // keystream block = E(counter)
+        size_t n = WBC_SESSION_KEY_BYTES - off;
+        if (n > 16) n = 16;
+        for (size_t i = 0; i < n; ++i) out[off + i] = in[off + i] ^ ks[i];
+        // big-endian 128-bit counter increment
+        for (int i = 15; i >= 0; --i) {
+            if (++counter[i] != 0) break;
+        }
+        // The keystream is as sensitive as the key it hides; do not leave it on
+        // the stack for a later dump to find.
+        sodium_memzero(ks.data(), ks.size());
     }
-    return WBC_OK;
+    sodium_memzero(counter.data(), counter.size());
+}
+}  // namespace
+
+wbc_status wbc_wrap_key(wbc_ctx* ctx, const uint8_t session_key[WBC_SESSION_KEY_BYTES],
+                        uint8_t wrapped[WBC_WRAPPED_KEY_BYTES]) {
+    if (!ctx || !session_key || !wrapped) return WBC_ERR_ARG;
+    if (!EnsureSodium()) return WBC_ERR_NOMEM;
+    try {
+        /* Fresh IV per wrap, generated here so a caller cannot reuse one. It is
+         * not secret; it travels in the clear ahead of the wrapped key. */
+        randombytes_buf(wrapped, WBC_BLOCK_BYTES);
+        CtrSessionKey(ctx->prog, wrapped, session_key, wrapped + WBC_BLOCK_BYTES);
+        return WBC_OK;
+    } catch (...) {
+        return WBC_ERR_NOMEM;
+    }
 }
 
-wbc_status wbc_crypt_ctr(wbc_ctx* ctx, const uint8_t iv[WBC_BLOCK_BYTES],
-                         const uint8_t* in, uint8_t* out, size_t len) {
-    if (!ctx || !iv || (!in && len) || (!out && len)) return WBC_ERR_ARG;
+wbc_status wbc_unwrap_key(wbc_ctx* ctx, const uint8_t wrapped[WBC_WRAPPED_KEY_BYTES],
+                          uint8_t session_key[WBC_SESSION_KEY_BYTES]) {
+    if (!ctx || !wrapped || !session_key) return WBC_ERR_ARG;
     try {
-        std::array<uint8_t, 16> counter{};
-        std::memcpy(counter.data(), iv, 16);
-        size_t off = 0;
-        while (off < len) {
-            auto ks = vm::Run(ctx->prog, counter);  // keystream block = E(counter)
-            size_t n = (len - off < 16) ? (len - off) : 16;
-            for (size_t i = 0; i < n; ++i) out[off + i] = in[off + i] ^ ks[i];
-            off += n;
-            // big-endian 128-bit counter increment
-            for (int i = 15; i >= 0; --i) {
-                if (++counter[i] != 0) break;
-            }
-        }
+        CtrSessionKey(ctx->prog, wrapped, wrapped + WBC_BLOCK_BYTES, session_key);
         return WBC_OK;
     } catch (...) {
         return WBC_ERR_NOMEM;
@@ -114,28 +156,11 @@ wbc_status wbc_crypt_ctr(wbc_ctx* ctx, const uint8_t iv[WBC_BLOCK_BYTES],
 
 /* ---- Bulk data helpers ---------------------------------------------------
  *
- * These are conventional XChaCha20-Poly1305, NOT white-box protected. They
- * exist so callers stop pushing megabytes through the VM at 0.045 MB/s: the
- * white-box wraps a session key, these move the payload. See the contract and
- * the memory-exposure caveat in wbcrypto.h.
- *
- * Sizes are checked against the libsodium constants with static_assert rather
- * than assumed, so a libsodium upgrade that changed them is a build error
- * instead of a buffer overflow.
+ * These are conventional XChaCha20-Poly1305, NOT white-box protected. They are
+ * the data mover of the key-wrapping pattern above: the white-box wraps a
+ * session key, these move the payload. See the contract and the memory-exposure
+ * caveat in wbcrypto.h.
  */
-static_assert(WBC_SESSION_KEY_BYTES == crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
-              "WBC_SESSION_KEY_BYTES must track libsodium's KEYBYTES");
-static_assert(WBC_BULK_OVERHEAD == crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
-                                       crypto_aead_xchacha20poly1305_ietf_ABYTES,
-              "WBC_BULK_OVERHEAD must track libsodium's NPUBBYTES + ABYTES");
-
-namespace {
-constexpr size_t kNonce = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;  // 24
-
-/* sodium_init() is idempotent; <0 means the RNG is unusable. */
-bool EnsureSodium() { return sodium_init() >= 0; }
-}  // namespace
-
 wbc_status wbc_random(uint8_t* buf, size_t len) {
     if (!buf && len) return WBC_ERR_ARG;
     if (!EnsureSodium()) return WBC_ERR_NOMEM;

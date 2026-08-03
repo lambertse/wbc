@@ -34,27 +34,6 @@ int main() {
     CHECK(wbc_encrypt_block(ctx, buf, buf) == WBC_OK);
     CHECK(std::memcmp(buf, ref.data(), 16) == 0);
 
-    // ECB multi-block == per-block AES.
-    uint8_t in3[48], out3[48];
-    for (int i = 0; i < 48; ++i) in3[i] = static_cast<uint8_t>(i * 7 + 1);
-    CHECK(wbc_encrypt_ecb(ctx, in3, out3, 48) == WBC_OK);
-    for (int b = 0; b < 3; ++b) {
-        wbaes::Block blk; std::memcpy(blk.data(), in3 + 16 * b, 16);
-        wbaes::Block e = AesEncryptBlock(blk, key);
-        CHECK(std::memcmp(out3 + 16 * b, e.data(), 16) == 0);
-    }
-    CHECK(wbc_encrypt_ecb(ctx, in3, out3, 47) == WBC_ERR_ARG);  // non-multiple
-
-    // CTR encrypt then decrypt (same call) round-trips arbitrary length.
-    const char* msg = "white-box AES in a VM, via the C SDK!";
-    size_t mlen = std::strlen(msg);
-    uint8_t iv[16] = {0};
-    std::vector<uint8_t> enc(mlen), dec(mlen);
-    CHECK(wbc_crypt_ctr(ctx, iv, reinterpret_cast<const uint8_t*>(msg), enc.data(), mlen) == WBC_OK);
-    CHECK(std::memcmp(enc.data(), msg, mlen) != 0);  // actually transformed
-    CHECK(wbc_crypt_ctr(ctx, iv, enc.data(), dec.data(), mlen) == WBC_OK);
-    CHECK(std::memcmp(dec.data(), msg, mlen) == 0);
-
     // wrong passphrase -> AEAD auth fails, blob does not open (v2 contract).
     wbc_ctx* wctx = nullptr;
     CHECK(wbc_open(blob, blen, "nope", &wctx) == WBC_ERR_FORMAT);
@@ -100,19 +79,36 @@ int main() {
         wbc_close(nctx); wbc_close(ectx); wbc_free(nblob);
     }
 
-    // ---- key wrapping: the documented pattern for real payloads ------------
+    // ---- key wrapping: the SDK's only data-bearing pattern ------------------
     // The white-box wraps a session key; a conventional AEAD moves the data.
     {
         uint8_t sk[WBC_SESSION_KEY_BYTES], sk_unwrapped[WBC_SESSION_KEY_BYTES];
-        uint8_t wrapped[WBC_SESSION_KEY_BYTES], iv[WBC_BLOCK_BYTES];
+        uint8_t wrapped[WBC_WRAPPED_KEY_BYTES];
         CHECK(wbc_random(sk, sizeof sk) == WBC_OK);
-        CHECK(wbc_random(iv, sizeof iv) == WBC_OK);
 
-        // wrap, then unwrap with the same call (CTR is its own inverse).
-        CHECK(wbc_crypt_ctr(ctx, iv, sk, wrapped, sizeof sk) == WBC_OK);
-        CHECK(std::memcmp(sk, wrapped, sizeof sk) != 0);  // it really was encrypted
-        CHECK(wbc_crypt_ctr(ctx, iv, wrapped, sk_unwrapped, sizeof sk) == WBC_OK);
+        CHECK(wbc_wrap_key(ctx, sk, wrapped) == WBC_OK);
+        // The wrapped key must not contain the plaintext key anywhere in it.
+        CHECK(std::memcmp(sk, wrapped + WBC_BLOCK_BYTES, sizeof sk) != 0);
+        CHECK(wbc_unwrap_key(ctx, wrapped, sk_unwrapped) == WBC_OK);
         CHECK(std::memcmp(sk, sk_unwrapped, sizeof sk) == 0);
+
+        // The IV is generated INSIDE wbc_wrap_key so it cannot be reused: CTR
+        // with a repeated IV under the same long-term key leaks the XOR of two
+        // session keys. Wrapping the SAME key twice must therefore produce
+        // different bytes. This is the test that keeps that guarantee honest --
+        // pin the IV to a constant and it fails.
+        uint8_t wrapped2[WBC_WRAPPED_KEY_BYTES];
+        CHECK(wbc_wrap_key(ctx, sk, wrapped2) == WBC_OK);
+        CHECK(std::memcmp(wrapped, wrapped2, WBC_WRAPPED_KEY_BYTES) != 0);
+        // ...and both still unwrap to the same key.
+        uint8_t sk3[WBC_SESSION_KEY_BYTES];
+        CHECK(wbc_unwrap_key(ctx, wrapped2, sk3) == WBC_OK);
+        CHECK(std::memcmp(sk, sk3, sizeof sk) == 0);
+
+        // Argument checks on the new pair.
+        CHECK(wbc_wrap_key(nullptr, sk, wrapped) == WBC_ERR_ARG);
+        CHECK(wbc_wrap_key(ctx, nullptr, wrapped) == WBC_ERR_ARG);
+        CHECK(wbc_unwrap_key(ctx, wrapped, nullptr) == WBC_ERR_ARG);
 
         // Bulk round-trip, including a 0-length payload and an odd length.
         for (size_t n : {size_t{0}, size_t{1}, size_t{4095}}) {
@@ -158,6 +154,39 @@ int main() {
         CHECK(wbc_bulk_open(sk, a, WBC_BULK_OVERHEAD - 1, b, &dummy) == WBC_ERR_ARG);
         CHECK(wbc_bulk_seal(nullptr, msg, sizeof msg, a, &dummy) == WBC_ERR_ARG);
         CHECK(wbc_random(nullptr, 4) == WBC_ERR_ARG);
+    }
+
+    // ---- corrupting a wrapped key is detected downstream --------------------
+    // wbc_wrap_key is deliberately NOT separately authenticated: a corrupted
+    // wrapped key unwraps to a WRONG session key, and the AEAD then rejects the
+    // payload. That is the argument for not adding a second MAC, so it needs to
+    // be a test rather than a claim in a comment.
+    {
+        uint8_t sk[WBC_SESSION_KEY_BYTES], wrapped[WBC_WRAPPED_KEY_BYTES];
+        CHECK(wbc_random(sk, sizeof sk) == WBC_OK);
+        CHECK(wbc_wrap_key(ctx, sk, wrapped) == WBC_OK);
+
+        const uint8_t payload[64] = {0};
+        uint8_t sealed[64 + WBC_BULK_OVERHEAD], opened[64];
+        size_t sealed_len = 0, opened_len = 0;
+        CHECK(wbc_bulk_seal(sk, payload, sizeof payload, sealed, &sealed_len) == WBC_OK);
+
+        // Flip a bit in the wrapped key's ciphertext half...
+        wrapped[WBC_BLOCK_BYTES] ^= 0x01;
+        uint8_t bad_sk[WBC_SESSION_KEY_BYTES];
+        CHECK(wbc_unwrap_key(ctx, wrapped, bad_sk) == WBC_OK);   // unwrap cannot tell
+        CHECK(std::memcmp(sk, bad_sk, sizeof sk) != 0);          // but the key is wrong
+        CHECK(wbc_bulk_open(bad_sk, sealed, sealed_len, opened,
+                            &opened_len) == WBC_ERR_AUTH);       // and the AEAD catches it
+        wrapped[WBC_BLOCK_BYTES] ^= 0x01;
+
+        // ...and flipping the IV half is caught the same way.
+        wrapped[0] ^= 0x80;
+        CHECK(wbc_unwrap_key(ctx, wrapped, bad_sk) == WBC_OK);
+        CHECK(std::memcmp(sk, bad_sk, sizeof sk) != 0);
+        CHECK(wbc_bulk_open(bad_sk, sealed, sealed_len, opened,
+                            &opened_len) == WBC_ERR_AUTH);
+        std::printf("  [wrap] corrupted wrapped key -> WBC_ERR_AUTH from the AEAD\n");
     }
 
     // error paths.

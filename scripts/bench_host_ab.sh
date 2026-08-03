@@ -63,7 +63,7 @@ case "$TOOL" in
     # aes_ref is plain AES. If IT moves, the machine moved and nothing else in the
     # table is trustworthy.
     bench)  BIN="wb_bench"; CONTROL="kdf_argon2id"
-            METRICS="kdf_argon2id vm_run encrypt_block crypt_ctr_4k open" ;;
+            METRICS="kdf_argon2id vm_run encrypt_block wrap_key open" ;;
     ladder) BIN="wb_ladder"; CONTROL="aes_ref_total"
             METRICS="aes_ref_total wb_interp vm_run" ;;
     *) echo "--tool must be bench or ladder" >&2; exit 1 ;;

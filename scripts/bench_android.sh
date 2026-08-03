@@ -20,12 +20,6 @@
 #   --reps N        wb_bench timed batches per metric (default 7)
 #   --open-reps N   reps for wbc_open / the KDF (default 5); raise to tighten the
 #                   `open - kdf` bound
-#   --bulk-mb N     ALSO time a full N-MiB CTR encrypt+decrypt on device (the
-#                   "how long does my N MB payload take?" number). OFF by default,
-#                   and for good reason: the white-box runs well under 1 MB/s, so
-#                   N=5 is ~2 min per leg — times 2 legs, times 2 builds, times
-#                   --rounds. Start at 1. The per-block ratio the A/B actually
-#                   needs is already covered by crypt_ctr_4k.
 #   --serial S      adb device serial (for multiple attached devices)
 #   --no-build      reuse the existing build-bench-{plain,omvll} trees
 #
@@ -46,7 +40,6 @@ CPU=""
 MIN_TIME=300
 REPS=7
 OPEN_REPS=5
-BULK_MB=0
 SERIAL=""
 DO_BUILD=1
 
@@ -60,7 +53,6 @@ while [ "$#" -gt 0 ]; do
         --min-time) MIN_TIME="$2"; shift 2 ;;
         --reps)     REPS="$2"; shift 2 ;;
         --open-reps) OPEN_REPS="$2"; shift 2 ;;
-        --bulk-mb)  BULK_MB="$2"; shift 2 ;;
         --serial)   SERIAL="$2"; shift 2 ;;
         --no-build) DO_BUILD=0; shift ;;
         -h|--help)  sed -n '2,30p' "$0"; exit 0 ;;
@@ -229,16 +221,12 @@ fi
 # this, a passphrase containing a quote breaks the remote command line.
 PASS_Q="'${PASS//\'/\'\\\'\'}'"
 
-# Only pass --bulk-mb when asked; 0 means "skip the slow large-payload pass".
-BULK_ARG=""
-[ "$BULK_MB" -gt 0 ] 2>/dev/null && BULK_ARG="--bulk-mb $BULK_MB"
-
 run_one() {  # run_one <plain|omvll> <round> -> writes $OUT/raw-<label>-<round>.csv
     local label="$1" round="$2"
     local dst="$OUT/raw-$label-$round.csv"
     "${ADB[@]}" shell "cd $DEV_DIR && ${PIN}./wb_bench_$label --blob bench.blob \
         --pass $PASS_Q --csv --label $label --min-time $MIN_TIME --reps $REPS \
-        --open-reps $OPEN_REPS $BULK_ARG" \
+        --open-reps $OPEN_REPS" \
         | tr -d '\r' > "$dst"
     # wb_bench exits non-zero on a correctness failure; adb shell does not
     # propagate that, so detect it from the absent CSV header instead.

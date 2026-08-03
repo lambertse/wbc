@@ -354,16 +354,25 @@ Surface:
 ```
 wbc_seal_key(key, pass, seed, hardened, &blob, &len)   # offline: key → sealed blob
 wbc_open(blob, len, pass, &ctx)                        # runtime: load a blob
-wbc_encrypt_block(ctx, in16, out16)                    # one ECB block
-wbc_encrypt_ecb(ctx, in, out, len)                     # many ECB blocks
-wbc_crypt_ctr(ctx, iv16, in, out, len)                 # CTR: encrypts AND decrypts
+wbc_encrypt_block(ctx, in16, out16)                    # one block — KAT/diagnostic only
+wbc_wrap_key(ctx, sk32, wrapped48)                     # white-box wraps a session key
+wbc_unwrap_key(ctx, wrapped48, sk32)                   # ...and recovers it
+wbc_random / wbc_wipe                                  # session-key hygiene
+wbc_bulk_seal(sk32, in, len, out, &out_len)            # conventional AEAD over the payload
+wbc_bulk_open(sk32, in, len, out, &out_len)
 wbc_close / wbc_free
 ```
 
 `wbc_ctx` simply owns a `vm::Program`; `wbc_encrypt_block` calls `vm::Run`.
-**CTR mode** turns the encrypt-only white-box into a full stream cipher (the same
-call enciphers and deciphers arbitrary-length data), which is what real payload
-use needs. Ships as `libwbcrypto.a` and `libwbcrypto.so`.
+
+**There is deliberately no bulk-through-the-VM entry point.** `wbc_encrypt_ecb` and
+`wbc_crypt_ctr` existed until 2.0.0 and were removed: the white-box runs at ~0.06
+MB/s, so any API shaped like "encrypt this buffer" is a trap. The only stream-cipher
+use left is CTR over exactly one session key, inside `wbc_wrap_key`, where the length
+is a compile-time constant rather than a caller argument — so the slow shape is not
+expressible. The white-box protects the KEY; the AEAD moves the DATA.
+
+Ships as `libwbcrypto.a` and `libwbcrypto.so`.
 
 ---
 

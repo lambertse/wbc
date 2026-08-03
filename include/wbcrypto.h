@@ -41,6 +41,8 @@ extern "C" {
 #define WBC_SESSION_KEY_BYTES 32
 /* Bytes wbc_bulk_seal adds to the plaintext: 24-byte nonce + 16-byte tag. */
 #define WBC_BULK_OVERHEAD 40
+/* A wrapped session key on the wire: 16-byte IV || 32-byte wrapped key. */
+#define WBC_WRAPPED_KEY_BYTES 48
 
 typedef enum wbc_status {
     WBC_OK         =  0,
@@ -80,49 +82,71 @@ WBC_API wbc_status wbc_seal_key(const uint8_t key[WBC_KEY_BYTES],
 WBC_API wbc_status wbc_open(const uint8_t* blob, size_t blob_len,
                             const char* passphrase, wbc_ctx** out_ctx);
 
-/* Encrypt exactly one 16-byte block (ECB). `in` and `out` may alias. */
+/* Encrypt exactly one 16-byte block.
+ *
+ * DIAGNOSTIC / KNOWN-ANSWER USE ONLY -- this is not a data path. It exists so a
+ * caller can confirm the blob really holds the key they think it does, by
+ * checking the FIPS-197 vector (key 000102..0f, plaintext 00112233..ff ->
+ * 69c4e0d86a7b0430d8cdb78070b4c55a). Do NOT loop it over a payload: the VM runs
+ * at well under 1 MB/s, so a megabyte takes minutes. Use the key-wrapping API
+ * below for anything that is actually data. `in` and `out` may alias. */
 WBC_API wbc_status wbc_encrypt_block(wbc_ctx* ctx,
                                      const uint8_t in[WBC_BLOCK_BYTES],
                                      uint8_t out[WBC_BLOCK_BYTES]);
 
-/* Encrypt `len` bytes in ECB mode; `len` must be a multiple of 16.
- * `in` and `out` may alias (identical pointers). */
-WBC_API wbc_status wbc_encrypt_ecb(wbc_ctx* ctx, const uint8_t* in,
-                                   uint8_t* out, size_t len);
-
-/* CTR mode over the white-box block cipher: the SAME call encrypts and
- * decrypts. Handles arbitrary `len` (no padding). `iv` is the initial 16-byte
- * counter (incremented big-endian per block). Because CTR only ever needs the
- * block-ENCRYPT primitive, this gives you decryption too, even though the
- * white-box itself only encrypts. `in`/`out` may alias. */
-WBC_API wbc_status wbc_crypt_ctr(wbc_ctx* ctx, const uint8_t iv[WBC_BLOCK_BYTES],
-                                 const uint8_t* in, uint8_t* out, size_t len);
-
-/* ---- Bulk data: key wrapping ---------------------------------------------
+/* ---- The one road: wrap a key with the white-box, move data with AEAD -----
  *
- * THE WHITE-BOX IS SLOW ON PURPOSE. It runs well under 1 MB/s (budget ~25 s per
- * MiB per leg), because every 16-byte block is ~13k obfuscated VM instructions.
- * Pushing megabytes through wbc_crypt_ctr is therefore the wrong shape. The
- * right shape is to protect a *key* with the white-box and move the *data* with
- * a conventional cipher:
+ * THE WHITE-BOX IS SLOW ON PURPOSE: every 16-byte block is thousands of
+ * obfuscated VM instructions, so it runs at well under 1 MB/s. The slowness IS
+ * the obfuscation -- it cannot be optimized away without deleting the
+ * protection. So the SDK deliberately offers NO way to push bulk data through
+ * it. Protect a *key* with the white-box and move the *data* conventionally:
  *
- *   wbc_random(sk, WBC_SESSION_KEY_BYTES);        // fresh session key
- *   wbc_crypt_ctr(ctx, iv, sk, wrapped, 32);      // white-box wraps it (2 blocks)
- *   wbc_bulk_seal(sk, data, n, out, &out_n);      // conventional AEAD moves data
+ *   uint8_t sk[WBC_SESSION_KEY_BYTES], wrapped[WBC_WRAPPED_KEY_BYTES];
+ *   wbc_random(sk, sizeof sk);                    // fresh session key
+ *   wbc_wrap_key(ctx, sk, wrapped);               // white-box wraps it (2 blocks)
+ *   wbc_bulk_seal(sk, data, n, out, &out_n);      // AEAD moves the payload
  *   wbc_wipe(sk, sizeof sk);                      // drop the plaintext key
  *
- * Store `wrapped` alongside the ciphertext. To read it back, unwrap with the
- * same wbc_crypt_ctr call (CTR is its own inverse) and wbc_bulk_open.
+ * Store `wrapped` next to the sealed payload. To read it back:
+ *
+ *   wbc_unwrap_key(ctx, wrapped, sk);
+ *   wbc_bulk_open(sk, in, in_len, out, &out_n);
+ *   wbc_wipe(sk, sizeof sk);
+ *
+ * The white-box cost is FIXED at two blocks per wrap -- it does not grow with
+ * the payload, so only the AEAD scales. A 5 MiB round trip is ~13 ms per leg
+ * this way, against ~85 s if the payload itself went through the VM.
  *
  * WHAT THIS DOES AND DOES NOT PROTECT. The white-box protects the LONG-TERM key
  * -- that key is never reconstructed in memory. It does NOT extend that
- * guarantee to the session key or the bulk data: between wbc_crypt_ctr and
+ * guarantee to the session key or the bulk data: between the unwrap and the
  * wbc_wipe, `sk` is an ordinary key in ordinary memory, and an attacker who can
  * dump the process gets it without attacking the white-box at all. This is a
  * deliberate trade of white-box coverage for throughput. Keep the plaintext
  * session key's lifetime as short as you can, prefer a fresh key per message
  * over a long-lived one, and always wbc_wipe it.
  */
+
+/* Wrap a session key with the white-box. `wrapped` receives IV || ciphertext.
+ *
+ * The IV is generated internally and prepended, so it cannot be reused: CTR
+ * with a repeated IV under the same long-term key would leak the XOR of two
+ * session keys, and making the caller supply it made that an easy mistake.
+ * Wrapping the same key twice therefore yields different bytes, by design.
+ *
+ * The wrap is NOT separately authenticated. A corrupted `wrapped` unwraps to a
+ * wrong session key, and wbc_bulk_open then fails its tag with WBC_ERR_AUTH --
+ * so corruption is detected where it matters, without a second MAC. */
+WBC_API wbc_status wbc_wrap_key(wbc_ctx* ctx,
+                                const uint8_t session_key[WBC_SESSION_KEY_BYTES],
+                                uint8_t wrapped[WBC_WRAPPED_KEY_BYTES]);
+
+/* Recover a session key produced by wbc_wrap_key. Returns WBC_OK for any
+ * well-formed input -- see the authentication note above. */
+WBC_API wbc_status wbc_unwrap_key(wbc_ctx* ctx,
+                                  const uint8_t wrapped[WBC_WRAPPED_KEY_BYTES],
+                                  uint8_t session_key[WBC_SESSION_KEY_BYTES]);
 
 /* Fill `buf` with cryptographically secure random bytes. */
 WBC_API wbc_status wbc_random(uint8_t* buf, size_t len);

@@ -93,16 +93,8 @@ bool ParseHex16(const std::string& s, std::array<uint8_t, 16>& out) {
 int Usage() {
     std::fprintf(stderr,
                  "usage: wb_bench --blob FILE [--pass P] [--min-time MS] [--reps N]\n"
-                 "                [--open-reps N] [--bulk-mb N] [--bulk-reps N]\n"
-                 "                [--csv] [--label TAG]\n"
+                 "                [--open-reps N] [--csv] [--label TAG]\n"
                  "\n"
-                 "  --bulk-mb N    ALSO run a realistic large-payload CTR pass over N MiB\n"
-                 "                 (encrypt, then decrypt, then verify the round-trip).\n"
-                 "                 This is the 'how long does my 5 MB file take?' number.\n"
-                 "                 SLOW: the white-box runs at well under 1 MB/s, so 5 MiB\n"
-                 "                 is minutes per leg. Off by default; an ETA is printed\n"
-                 "                 before it starts. Try --bulk-mb 1 first.\n"
-                 "  --bulk-reps N  repetitions of the bulk pass (default 1)\n"
                  "  --blob FILE    sealed blob to benchmark (required; generate with\n"
                  "                 scripts/gen_blob.sh on the HOST, never on device)\n"
                  "  --pass P       blob passphrase (default: empty)\n"
@@ -119,8 +111,7 @@ int Usage() {
 int main(int argc, char** argv) {
     std::string blob_path, pass, label = "unlabeled";
     double min_ms = 300.0;
-    int reps = 7, open_reps = 5, bulk_reps = 1;
-    uint64_t bulk_mb = 0;  // 0 = skip the (slow) large-payload pass
+    int reps = 7, open_reps = 5;
     bool csv = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -132,8 +123,6 @@ int main(int argc, char** argv) {
         else if (a == "--min-time") min_ms = std::strtod(next().c_str(), nullptr);
         else if (a == "--reps") reps = std::atoi(next().c_str());
         else if (a == "--open-reps") open_reps = std::atoi(next().c_str());
-        else if (a == "--bulk-mb") bulk_mb = std::strtoull(next().c_str(), nullptr, 0);
-        else if (a == "--bulk-reps") bulk_reps = std::atoi(next().c_str());
         else if (a == "--csv") csv = true;
         else if (a == "-h" || a == "--help") return Usage();
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return Usage(); }
@@ -197,27 +186,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "wb_bench: GATE FAIL vm::Run != wbc_encrypt_block\n");
         ++gate_failures;
     }
-    {   // ECB over 3 blocks == 3 single-block encryptions.
-        uint8_t in[48], ecb[48], one[48];
-        for (int i = 0; i < 48; ++i) in[i] = static_cast<uint8_t>(i * 7 + 1);
-        if (wbc_encrypt_ecb(ctx, in, ecb, sizeof in) != WBC_OK) ++gate_failures;
-        for (int b = 0; b < 3; ++b) {
-            if (wbc_encrypt_block(ctx, in + 16 * b, one + 16 * b) != WBC_OK) ++gate_failures;
-        }
-        if (std::memcmp(ecb, one, sizeof ecb) != 0) {
-            std::fprintf(stderr, "wb_bench: GATE FAIL wbc_encrypt_ecb != per-block\n");
-            ++gate_failures;
-        }
-    }
-    {   // CTR is its own inverse over an arbitrary (non-multiple-of-16) length.
-        const char* msg = "wb_bench CTR round-trip check, odd length";
-        size_t n = std::strlen(msg);
-        uint8_t iv[16] = {0};
-        std::vector<uint8_t> enc(n), dec(n);
-        if (wbc_crypt_ctr(ctx, iv, reinterpret_cast<const uint8_t*>(msg), enc.data(), n) != WBC_OK ||
-            wbc_crypt_ctr(ctx, iv, enc.data(), dec.data(), n) != WBC_OK ||
-            std::memcmp(dec.data(), msg, n) != 0) {
-            std::fprintf(stderr, "wb_bench: GATE FAIL wbc_crypt_ctr does not round-trip\n");
+    {   // The shipped data path: wrap a session key, unwrap it, get it back.
+        uint8_t sk[WBC_SESSION_KEY_BYTES], sk2[WBC_SESSION_KEY_BYTES];
+        uint8_t wrapped[WBC_WRAPPED_KEY_BYTES];
+        if (wbc_random(sk, sizeof sk) != WBC_OK ||
+            wbc_wrap_key(ctx, sk, wrapped) != WBC_OK ||
+            wbc_unwrap_key(ctx, wrapped, sk2) != WBC_OK ||
+            std::memcmp(sk, sk2, sizeof sk) != 0) {
+            std::fprintf(stderr, "wb_bench: GATE FAIL wrap/unwrap does not round-trip\n");
             ++gate_failures;
         }
     }
@@ -280,34 +256,54 @@ int main(int argc, char** argv) {
             return acc;
         }));
     }
-    {   // Bulk ECB: shows how much of that per-call cost the loop pays per block.
-        std::vector<uint8_t> buf(kBulkBytes);
-        for (size_t i = 0; i < buf.size(); ++i) buf[i] = static_cast<uint8_t>(i);
+    {   // wrap_key: the ENTIRE white-box cost of a real use, and the only one that
+        // matters — it is two blocks plus a random IV regardless of how big the
+        // payload is. Not byte-rated on purpose: a MB/s figure over 32 bytes
+        // would invite exactly the "so N MB takes N/rate" extrapolation that the
+        // key-wrapping design exists to make wrong.
+        uint8_t sk[WBC_SESSION_KEY_BYTES], wrapped[WBC_WRAPPED_KEY_BYTES];
+        if (wbc_random(sk, sizeof sk) != WBC_OK) { wbc_close(ctx); return 1; }
         results.push_back(
-            Measure("encrypt_ecb_4k", min_ms, reps, kBulkBytes, 0, true, sink, [&](uint64_t n) {
+            Measure("wrap_key", min_ms, reps, 0, 0, true, sink, [&](uint64_t n) {
                 uint64_t acc = 0;
                 for (uint64_t i = 0; i < n; ++i) {
-                    if (wbc_encrypt_ecb(ctx, buf.data(), buf.data(), buf.size()) != WBC_OK)
-                        return acc;
-                    acc += buf[0];
+                    sk[0] = static_cast<uint8_t>(i);
+                    if (wbc_wrap_key(ctx, sk, wrapped) != WBC_OK) return acc;
+                    acc += wrapped[0];
+                }
+                return acc;
+            }));
+        results.push_back(
+            Measure("unwrap_key", min_ms, reps, 0, 0, true, sink, [&](uint64_t n) {
+                uint64_t acc = 0;
+                uint8_t out[WBC_SESSION_KEY_BYTES];
+                for (uint64_t i = 0; i < n; ++i) {
+                    wrapped[WBC_BLOCK_BYTES] = static_cast<uint8_t>(i);
+                    if (wbc_unwrap_key(ctx, wrapped, out) != WBC_OK) return acc;
+                    acc += out[0];
                 }
                 return acc;
             }));
     }
-    {   // Bulk CTR: the mode a real integrator uses (also provides decryption).
-        std::vector<uint8_t> buf(kBulkBytes);
-        for (size_t i = 0; i < buf.size(); ++i) buf[i] = static_cast<uint8_t>(i);
-        uint8_t iv[16] = {0};
+    {   // The other half of the only path: conventional AEAD over the payload.
+        // This is what actually scales with data, and it is NOT white-box
+        // protected — see the caveat in wbcrypto.h.
+        uint8_t sk[WBC_SESSION_KEY_BYTES];
+        if (wbc_random(sk, sizeof sk) != WBC_OK) { wbc_close(ctx); return 1; }
+        std::vector<uint8_t> in(kBulkBytes), out(kBulkBytes + WBC_BULK_OVERHEAD);
+        for (size_t i = 0; i < in.size(); ++i) in[i] = static_cast<uint8_t>(i);
         results.push_back(
-            Measure("crypt_ctr_4k", min_ms, reps, kBulkBytes, 0, true, sink, [&](uint64_t n) {
+            Measure("bulk_seal_4k", min_ms, reps, kBulkBytes, 0, true, sink, [&](uint64_t n) {
                 uint64_t acc = 0;
+                size_t out_len = 0;
                 for (uint64_t i = 0; i < n; ++i) {
-                    if (wbc_crypt_ctr(ctx, iv, buf.data(), buf.data(), buf.size()) != WBC_OK)
+                    if (wbc_bulk_seal(sk, in.data(), in.size(), out.data(), &out_len) != WBC_OK)
                         return acc;
-                    acc += buf[0];
+                    acc += out[0];
                 }
                 return acc;
             }));
+        wbc_wipe(sk, sizeof sk);
     }
     {   // Cold gate path. trusted_storage.cpp gets the heaviest pass set
         // (flatten + MBA + opaque constants + string encoding), but Argon2id
@@ -342,94 +338,12 @@ int main(int argc, char** argv) {
         }));
     }
 
-    // ---- optional large-payload pass (the "how long does 5 MB take?" number) --
-    // Answers a different question from crypt_ctr_4k: not "what is the per-block
-    // rate" but "what is the real wall clock for a payload I actually have".
-    //
-    // Note CTR is its own inverse, so this is also the ONLY decryption path in the
-    // SDK — the white-box has no inverse tables, and wbc_encrypt_ecb cannot decrypt
-    // at all. Encrypt and decrypt therefore cost exactly the same (both just
-    // generate keystream and XOR); both legs are timed so that is visible rather
-    // than asserted, and the round-trip check comes free.
-    bool bulk_verified = false;
-    if (bulk_mb > 0) {
-        const size_t bulk_bytes = static_cast<size_t>(bulk_mb) * 1024u * 1024u;
-        if (bulk_reps < 1) bulk_reps = 1;
-
-        // Project the runtime from the already-measured 4 KiB rate. Without this a
-        // multi-minute silent pass is indistinguishable from a hang.
-        double ns_per_byte = 0;
-        for (const Result& r : results)
-            if (r.name == "crypt_ctr_4k") ns_per_byte = r.min_ns / static_cast<double>(kBulkBytes);
-        if (ns_per_byte > 0) {
-            double eta_s = ns_per_byte * static_cast<double>(bulk_bytes) * 2.0 *
-                           static_cast<double>(bulk_reps) / 1e9;
-            std::fprintf(stderr,
-                         "  [bulk] %llu MiB CTR encrypt + decrypt x%d — projected ~%.0f s "
-                         "(%.1f min) at the measured %.3f MB/s. Working...\n",
-                         static_cast<unsigned long long>(bulk_mb), bulk_reps, eta_s, eta_s / 60.0,
-                         1000.0 / ns_per_byte);
-        }
-
-        try {
-            std::vector<uint8_t> plain(bulk_bytes), cipher(bulk_bytes), decrypted(bulk_bytes);
-            for (size_t i = 0; i < bulk_bytes; ++i) plain[i] = static_cast<uint8_t>(i * 31 + 7);
-            const uint8_t iv[16] = {0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-
-            char nm_enc[64], nm_dec[64];
-            std::snprintf(nm_enc, sizeof nm_enc, "ctr_encrypt_%llumb",
-                          static_cast<unsigned long long>(bulk_mb));
-            std::snprintf(nm_dec, sizeof nm_dec, "ctr_decrypt_%llumb",
-                          static_cast<unsigned long long>(bulk_mb));
-
-            // warmup=false: an extra untimed pass would double a multi-minute run.
-            results.push_back(Measure(nm_enc, min_ms, bulk_reps, bulk_bytes, 1, false, sink,
-                                      [&](uint64_t n) {
-                                          uint64_t acc = 0;
-                                          for (uint64_t i = 0; i < n; ++i) {
-                                              if (wbc_crypt_ctr(ctx, iv, plain.data(),
-                                                                cipher.data(), bulk_bytes) != WBC_OK)
-                                                  return acc;
-                                              acc += cipher[0];
-                                          }
-                                          return acc;
-                                      }));
-            std::fprintf(stderr, "  [bulk] encrypt leg done; decrypting...\n");
-
-            results.push_back(Measure(nm_dec, min_ms, bulk_reps, bulk_bytes, 1, false, sink,
-                                      [&](uint64_t n) {
-                                          uint64_t acc = 0;
-                                          for (uint64_t i = 0; i < n; ++i) {
-                                              if (wbc_crypt_ctr(ctx, iv, cipher.data(),
-                                                                decrypted.data(),
-                                                                bulk_bytes) != WBC_OK)
-                                                  return acc;
-                                              acc += decrypted[0];
-                                          }
-                                          return acc;
-                                      }));
-
-            // The payload must survive the round trip, and must actually have been
-            // transformed (a no-op "cipher" would look fast and be worthless).
-            bulk_verified = std::memcmp(decrypted.data(), plain.data(), bulk_bytes) == 0 &&
-                            std::memcmp(cipher.data(), plain.data(), bulk_bytes) != 0;
-            if (!bulk_verified) {
-                std::fprintf(stderr, "  [bulk] FAIL: %llu MiB CTR round-trip did not verify\n",
-                             static_cast<unsigned long long>(bulk_mb));
-                wbc_close(ctx);
-                return 1;
-            }
-            std::fprintf(stderr, "  [bulk] round-trip verified (%llu MiB)\n",
-                         static_cast<unsigned long long>(bulk_mb));
-        } catch (const std::bad_alloc&) {
-            std::fprintf(stderr,
-                         "  [bulk] cannot allocate 3 x %llu MiB for the bulk buffers; "
-                         "lower --bulk-mb\n",
-                         static_cast<unsigned long long>(bulk_mb));
-            wbc_close(ctx);
-            return 1;
-        }
-    }
+    // NOTE: there is deliberately no large-payload pass here any more. The SDK
+    // offers no way to push bulk data through the white-box (wbc_encrypt_ecb and
+    // wbc_crypt_ctr were removed in 2.0.0), so "how long does 5 MB take?" is now
+    // answered by wrap_key + bulk_seal_4k: a fixed ~0.5 ms of white-box work
+    // plus conventional AEAD over the payload. examples/keywrap.c shows the
+    // end-to-end number.
 
     // ---- report ------------------------------------------------------------
     const std::string ct_hex = ToHex(ct_vm.data(), 16);
@@ -459,11 +373,8 @@ int main(int argc, char** argv) {
     // image into the context on every block (see ctx.data = prog.data in vm.cpp).
     std::printf("  geometry  : code=%zu B  data=%zu B (copied per block)  block_off=%u\n",
                 prog.code.size(), prog.data.size(), prog.block_off);
-    std::printf("  sampling  : min-time=%.0f ms  reps=%d  open-reps=%d", min_ms, reps, open_reps);
-    if (bulk_mb > 0)
-        std::printf("  bulk=%lluMiB x%d %s", static_cast<unsigned long long>(bulk_mb), bulk_reps,
-                    bulk_verified ? "(round-trip OK)" : "(UNVERIFIED)");
-    std::printf("\n\n");
+    std::printf("  sampling  : min-time=%.0f ms  reps=%d  open-reps=%d\n\n", min_ms, reps,
+                open_reps);
 
     std::printf("  %-16s %12s %14s %14s %12s\n", "metric", "iters", "median", "min", "MB/s");
     std::printf("  %-16s %12s %14s %14s %12s\n", "----------------", "------------",
@@ -497,11 +408,15 @@ int main(int argc, char** argv) {
     const Result* copy = nullptr;
     const Result* open = nullptr;
     const Result* kdf = nullptr;
+    const Result* wrap = nullptr;
+    const Result* seal = nullptr;
     for (const Result& r : results) {
         if (r.name == "vm_run") vm = &r;
         if (r.name == "data_copy") copy = &r;
         if (r.name == "open") open = &r;
         if (r.name == "kdf_argon2id") kdf = &r;
+        if (r.name == "wrap_key") wrap = &r;
+        if (r.name == "bulk_seal_4k") seal = &r;
     }
 
     // Subtractions use min_ns, not median_ns: under additive noise (scheduler,
@@ -520,31 +435,16 @@ int main(int argc, char** argv) {
                     100.0 * copy->min_ns / vm->min_ns);
         std::printf("                         really is the interpreter's own cost)\n");
     }
-    // The headline for a bulk run: total wall clock for the payload, which is what
-    // an integrator actually budgets against. Reported per leg AND as a sum, since
-    // a real "open a sealed file and read it" flow pays wbc_open once plus one
-    // decrypt pass.
-    if (bulk_mb > 0) {
-        const Result* benc = nullptr;
-        const Result* bdec = nullptr;
-        for (const Result& r : results) {
-            if (r.name.rfind("ctr_encrypt_", 0) == 0) benc = &r;
-            if (r.name.rfind("ctr_decrypt_", 0) == 0) bdec = &r;
-        }
-        if (bdec) {
-            std::printf("    %llu MiB decrypt      : %.1f s  (%.3f MB/s)\n",
-                        static_cast<unsigned long long>(bulk_mb), bdec->min_ns / 1e9, bdec->mb_s);
-            if (benc)
-                std::printf("    %llu MiB encrypt      : %.1f s  (%.3f MB/s — same cost; CTR "
-                            "keystream either way)\n",
-                            static_cast<unsigned long long>(bulk_mb), benc->min_ns / 1e9,
-                            benc->mb_s);
-            if (open)
-                std::printf("    open + %llu MiB decrypt: %.1f s  (a cold 'open the sealed file "
-                            "and read it' flow)\n",
-                            static_cast<unsigned long long>(bulk_mb),
-                            (open->min_ns + bdec->min_ns) / 1e9);
-        }
+    // What a payload actually costs now: a FIXED white-box charge (the wrap) plus
+    // conventional AEAD that scales. Printed as a per-MiB projection of the AEAD
+    // half only, because the wrap does not grow with the payload — which is the
+    // whole point of the design and the thing a reader must not get wrong.
+    if (wrap && seal && seal->mb_s > 0) {
+        const double aead_s_per_mib = 1.048576 / seal->mb_s;  // MiB / (MB/s)
+        std::printf("    per payload        : %.2f ms fixed (wrap) + %.1f ms per MiB (AEAD)\n",
+                    wrap->min_ns / 1e6, aead_s_per_mib * 1000.0);
+        std::printf("                         The wrap is 2 white-box blocks whatever the\n");
+        std::printf("                         payload size, so only the AEAD term scales.\n");
     }
     if (open && kdf) {
         const double diff = open->min_ns - kdf->min_ns;

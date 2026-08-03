@@ -1,21 +1,26 @@
-/* keywrap.c — the pattern to use for anything bigger than a few hundred bytes.
+/* keywrap.c — how to use this SDK. This is the only shape it offers.
  *
- * The white-box runs well under 1 MB/s: every 16-byte block is ~13k obfuscated
- * VM instructions, so a 5 MiB payload pushed through wbc_crypt_ctr takes over
- * two minutes per leg. That is inherent to the construction, not a bug to be
- * optimized away — the slowness IS the obfuscation.
+ * The white-box runs at well under 1 MB/s: every 16-byte block is thousands of
+ * obfuscated VM instructions. That slowness IS the obfuscation — it cannot be
+ * optimized away without deleting the protection. So the SDK deliberately has no
+ * bulk entry point. You protect a KEY with the white-box and move the DATA
+ * conventionally:
  *
- * So don't push data through it. Push a KEY through it:
+ *     white-box   ──wraps──▶  32-byte session key   (2 blocks, ~0.5 ms, FIXED)
+ *     session key ──seals──▶  the actual payload    (XChaCha20-Poly1305, GB/s)
  *
- *     white-box  ──wraps──▶  32-byte session key   (2 blocks, ~1 ms)
- *     session key ──seals──▶ the actual payload    (conventional AEAD, GB/s)
+ * The white-box charge does not grow with the payload, so only the AEAD term
+ * scales. A 5 MiB round trip is ~13 ms per leg.
  *
- * The long-term key still never exists in memory. What you give up is that the
- * SESSION key does: see the caveat printed at the end and documented in
- * include/wbcrypto.h.
+ * The long-term key is never reconstructed. What you give up is that the SESSION
+ * key exists in plaintext memory between the unwrap and the wipe — see the
+ * CAVEAT printed at the end, and include/wbcrypto.h.
  *
- * This demo links libwbprovision because it seals its own blob for
- * self-containment. A field app links only libwbcrypto and calls wbc_open.
+ * This demo seals its own blob for self-containment, so it links
+ * libwbprovision. A field app links only libwbcrypto and calls wbc_open on a
+ * blob produced offline by wb_keygen.
+ *
+ * Usage:  ./build/keywrap [payload-MiB]     (1..4096, default 1)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,13 +29,6 @@
 
 #include "wbcrypto.h"
 
-/* Payload size in MiB, settable from the command line so you can compare this
- * directly against the same payload pushed through the VM:
- *
- *   ./build/keywrap 5
- *   ./build/wb_bench --blob sealed.blob --pass demo --bulk-mb 5
- *
- * Same 5 MiB, same long-term key, two different code paths. */
 static size_t g_payload_bytes = 1u << 20; /* 1 MiB default */
 #define PAYLOAD_BYTES g_payload_bytes
 
@@ -61,6 +59,8 @@ int main(int argc, char** argv) {
     const char* pass = "keywrap-demo";
     wbc_status s;
 
+    printf("wbcrypto version %s\n", wbc_version());
+
     uint8_t* blob = NULL;
     size_t blob_len = 0;
     s = wbc_seal_key(long_term_key, pass, 42, 1, &blob, &blob_len);
@@ -87,16 +87,11 @@ int main(int argc, char** argv) {
     s = wbc_random(sk, sizeof sk);
     if (s != WBC_OK) { fprintf(stderr, "random: %s\n", wbc_strerror(s)); return 1; }
 
-    /* The white-box wraps the session key: 32 bytes = 2 VM blocks. The IV must
-     * be unique per wrap under this long-term key — CTR with a repeated IV
-     * reuses keystream, which would leak the XOR of two session keys. Store it
-     * next to the wrapped key; it is not secret. */
-    uint8_t wrap_iv[WBC_BLOCK_BYTES], wrapped_sk[WBC_SESSION_KEY_BYTES];
-    s = wbc_random(wrap_iv, sizeof wrap_iv);
-    if (s != WBC_OK) { fprintf(stderr, "random: %s\n", wbc_strerror(s)); return 1; }
-
+    /* The white-box wraps the session key. No IV to manage: wbc_wrap_key
+     * generates one internally and prepends it, so it cannot be reused. */
+    uint8_t wrapped[WBC_WRAPPED_KEY_BYTES];
     double t_wrap0 = now_ms();
-    s = wbc_crypt_ctr(ctx, wrap_iv, sk, wrapped_sk, sizeof sk);
+    s = wbc_wrap_key(ctx, sk, wrapped);
     double t_wrap = now_ms() - t_wrap0;
     if (s != WBC_OK) { fprintf(stderr, "wrap: %s\n", wbc_strerror(s)); return 1; }
 
@@ -114,22 +109,30 @@ int main(int argc, char** argv) {
     printf("WRITE\n");
     printf("  wrap session key (white-box, 2 blocks) : %8.2f ms\n", t_wrap);
     printf("  seal payload     (conventional AEAD)   : %8.2f ms\n", t_seal);
-    printf("  total                                  : %8.2f ms  -> %zu bytes\n\n",
-           t_write, sealed_len);
+    printf("  total                                  : %8.2f ms\n\n", t_write);
 
-    /* On disk/wire you store: wrap_iv || wrapped_sk || sealed. */
+    /* ---- what you actually store or send -------------------------------- */
+    /* Wire format: the 48-byte wrapped key, then the sealed payload. The wrapped
+     * key already carries its own IV, and the sealed payload its own nonce, so
+     * there is nothing else to keep track of. */
+    size_t msg_len = WBC_WRAPPED_KEY_BYTES + sealed_len;
+    uint8_t* msg = (uint8_t*)malloc(msg_len);
+    if (!msg) { fprintf(stderr, "oom\n"); return 1; }
+    memcpy(msg, wrapped, WBC_WRAPPED_KEY_BYTES);
+    memcpy(msg + WBC_WRAPPED_KEY_BYTES, sealed, sealed_len);
+    printf("message: %zu bytes = %d (wrapped key) + %zu (sealed payload)\n\n",
+           msg_len, WBC_WRAPPED_KEY_BYTES, sealed_len);
 
     /* ---- READ ----------------------------------------------------------- */
     t0 = now_ms();
     uint8_t sk2[WBC_SESSION_KEY_BYTES];
-    /* CTR is its own inverse, so unwrapping is the same call. */
-    s = wbc_crypt_ctr(ctx, wrap_iv, wrapped_sk, sk2, sizeof sk2);
+    s = wbc_unwrap_key(ctx, msg, sk2);
     if (s != WBC_OK) { fprintf(stderr, "unwrap: %s\n", wbc_strerror(s)); return 1; }
 
     size_t opened_len = 0;
-    s = wbc_bulk_open(sk2, sealed, sealed_len, opened, &opened_len);
+    s = wbc_bulk_open(sk2, msg + WBC_WRAPPED_KEY_BYTES, msg_len - WBC_WRAPPED_KEY_BYTES,
+                      opened, &opened_len);
     if (s != WBC_OK) { fprintf(stderr, "bulk_open: %s\n", wbc_strerror(s)); return 1; }
-    wbc_wipe(sk2, sizeof sk2);
     double t_read = now_ms() - t0;
 
     int ok = (opened_len == PAYLOAD_BYTES) && memcmp(payload, opened, PAYLOAD_BYTES) == 0;
@@ -137,30 +140,54 @@ int main(int argc, char** argv) {
     printf("  total                                  : %8.2f ms\n", t_read);
     printf("  round-trip                             : %s\n\n", ok ? "OK" : "FAIL");
 
-    /* A forged tag must be rejected rather than returning garbage. */
-    sealed[sealed_len - 1] ^= 0x01;
-    s = wbc_bulk_open(sk2, sealed, sealed_len, opened, &opened_len);
-    printf("tamper detection: %s\n", s == WBC_ERR_AUTH ? "rejected (WBC_ERR_AUTH)" : "NOT DETECTED");
-    sealed[sealed_len - 1] ^= 0x01;
+    /* ---- tamper detection ------------------------------------------------
+     * Run this BEFORE wiping sk2. Using a wiped (all-zero) key would make the
+     * AEAD reject the payload for the wrong reason, and the check would pass
+     * even with the bit-flip removed — i.e. assert nothing. */
+    int tamper_ok = 1;
+    {
+        /* A flipped bit in the sealed payload must fail the tag. */
+        msg[msg_len - 1] ^= 0x01;
+        s = wbc_bulk_open(sk2, msg + WBC_WRAPPED_KEY_BYTES, msg_len - WBC_WRAPPED_KEY_BYTES,
+                          opened, &opened_len);
+        printf("tamper (payload): %s\n",
+               s == WBC_ERR_AUTH ? "rejected (WBC_ERR_AUTH)" : "NOT DETECTED");
+        if (s != WBC_ERR_AUTH) tamper_ok = 0;
+        msg[msg_len - 1] ^= 0x01;
 
-    /* ---- the comparison this example exists to make ---------------------- */
-    double per_block_ms = t_wrap / 2.0; /* 32 bytes = 2 white-box blocks */
-    double direct_ms = per_block_ms * ((double)PAYLOAD_BYTES / WBC_BLOCK_BYTES);
-    printf("\nSame payload straight through wbc_crypt_ctr would take about"
-           " %.0f s per leg\n", direct_ms / 1000.0);
-    printf("(extrapolated from the measured wrap: %.3f ms per 16-byte block).\n",
-           per_block_ms);
-    printf("Key wrapping is ~%.0fx faster here and protects the same long-term key.\n",
-           direct_ms / (t_write > 0.001 ? t_write : 0.001));
+        /* A flipped bit in the WRAPPED KEY is caught too, indirectly: the wrap is
+         * not separately authenticated, so it unwraps "successfully" to a wrong
+         * key — and the AEAD then rejects the payload. That is why no second MAC
+         * is needed on the wrap. */
+        msg[WBC_BLOCK_BYTES] ^= 0x01;
+        uint8_t bad_sk[WBC_SESSION_KEY_BYTES];
+        s = wbc_unwrap_key(ctx, msg, bad_sk);
+        if (s == WBC_OK) {
+            s = wbc_bulk_open(bad_sk, msg + WBC_WRAPPED_KEY_BYTES,
+                              msg_len - WBC_WRAPPED_KEY_BYTES, opened, &opened_len);
+        }
+        printf("tamper (wrapped key): %s\n",
+               s == WBC_ERR_AUTH ? "rejected (WBC_ERR_AUTH)" : "NOT DETECTED");
+        if (s != WBC_ERR_AUTH) tamper_ok = 0;
+        wbc_wipe(bad_sk, sizeof bad_sk);
+        msg[WBC_BLOCK_BYTES] ^= 0x01;
+    }
+    wbc_wipe(sk2, sizeof sk2);
 
-    print_hex("\nwrapped session key: ", wrapped_sk, sizeof wrapped_sk);
+    /* ---- the point ------------------------------------------------------- */
+    printf("\nThe white-box cost above (%.2f ms) is TWO blocks and does not grow\n", t_wrap);
+    printf("with the payload — wrap a 5 GiB payload's key and it is still %.2f ms.\n", t_wrap);
+    printf("Only the AEAD line scales. There is deliberately no way to push the\n");
+    printf("payload itself through the white-box: it would run at ~0.06 MB/s.\n");
+
+    print_hex("\nwrapped session key: ", wrapped, WBC_WRAPPED_KEY_BYTES);
     printf("\nCAVEAT: between the unwrap and the wbc_wipe, the session key is an\n"
            "ordinary key in ordinary memory. The white-box protects the LONG-TERM\n"
            "key; it does not extend that guarantee to the session key or the bulk\n"
            "data. Keep its lifetime short and prefer a fresh key per message.\n");
 
-    free(payload); free(sealed); free(opened);
+    free(payload); free(sealed); free(opened); free(msg);
     wbc_close(ctx);
     wbc_free(blob);
-    return ok ? 0 : 1;
+    return (ok && tamper_ok) ? 0 : 1;
 }

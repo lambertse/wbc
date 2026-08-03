@@ -154,7 +154,10 @@ cat <<'EOF'
   encrypt_block   the same work through the C ABI. wbcrypto.cpp is sensitive but
                   not hot, so this wrapper IS fully flattened. Expect a worse
                   ratio than vm_run; the gap is the SDK-glue cost.
-  encrypt_ecb_4k  how much of that per-call cost the bulk loop pays per block.
+  wrap_key        the whole white-box cost of a real use: two blocks to wrap a
+                  session key. Fixed — it does not grow with the payload.
+  bulk_seal_4k    the conventional AEAD that moves the payload. NOT white-box
+                  protected and not obfuscated, so expect a ratio near 1.00x.
   open            ~97% Argon2id, so its ratio is near 1.00x by construction and
                   says nothing about the obfuscated loader. See `open - kdf`,
                   which usually reports a BOUND rather than a value — the loader

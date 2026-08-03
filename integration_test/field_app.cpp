@@ -118,18 +118,42 @@ int main(int argc, char** argv) {
                     "    integration has now made possible by clearing Layer 1.)\n\n");
     }
 
-    // 4. Realistic usage: CTR mode encrypts and decrypts arbitrary-length data.
+    // 4. Realistic usage: the white-box wraps a session key, a conventional AEAD
+    //    moves the data. This is the SDK's only data-bearing path — there is no
+    //    bulk-through-the-VM entry point, because the VM runs at ~0.06 MB/s.
     const char* msg = "white-box AES inside a virtual machine!";
     size_t mlen = std::strlen(msg);
-    uint8_t iv[16] = {0};
-    std::vector<uint8_t> enc(mlen), dec(mlen + 1);
-    wbc_crypt_ctr(ctx, iv, reinterpret_cast<const uint8_t*>(msg), enc.data(), mlen);
-    print_hex("CTR cipher:     ", enc.data(), mlen);
-    wbc_crypt_ctr(ctx, iv, enc.data(), dec.data(), mlen);  // same call decrypts
-    dec[mlen] = '\0';
-    std::printf("CTR decrypt:    %s\n", reinterpret_cast<char*>(dec.data()));
+
+    uint8_t sk[WBC_SESSION_KEY_BYTES], wrapped[WBC_WRAPPED_KEY_BYTES];
+    std::vector<uint8_t> sealed(mlen + WBC_BULK_OVERHEAD), opened(mlen + 1);
+    size_t sealed_len = 0, opened_len = 0;
+
+    if (wbc_random(sk, sizeof sk) != WBC_OK ||
+        wbc_wrap_key(ctx, sk, wrapped) != WBC_OK ||
+        wbc_bulk_seal(sk, reinterpret_cast<const uint8_t*>(msg), mlen, sealed.data(),
+                      &sealed_len) != WBC_OK) {
+        std::fprintf(stderr, "wrap/seal failed\n");
+        wbc_close(ctx);
+        return 5;
+    }
+    wbc_wipe(sk, sizeof sk);
+    print_hex("wrapped key:    ", wrapped, sizeof wrapped);
+    print_hex("sealed payload: ", sealed.data(), sealed_len < 24 ? sealed_len : 24);
+
+    // Read side: unwrap the session key, then open the payload.
+    uint8_t sk2[WBC_SESSION_KEY_BYTES];
+    if (wbc_unwrap_key(ctx, wrapped, sk2) != WBC_OK ||
+        wbc_bulk_open(sk2, sealed.data(), sealed_len, opened.data(), &opened_len) != WBC_OK) {
+        std::fprintf(stderr, "unwrap/open failed\n");
+        wbc_close(ctx);
+        return 5;
+    }
+    wbc_wipe(sk2, sizeof sk2);
+    opened[opened_len] = '\0';
+    std::printf("opened:         %s\n", reinterpret_cast<char*>(opened.data()));
     std::printf("round-trip:     %s\n",
-                std::memcmp(msg, dec.data(), mlen) == 0 ? "OK" : "FAIL");
+                (opened_len == mlen && std::memcmp(msg, opened.data(), mlen) == 0) ? "OK"
+                                                                                  : "FAIL");
 
     wbc_close(ctx);
     return kat_ok ? 0 : 5;

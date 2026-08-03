@@ -64,7 +64,8 @@ Outputs land in `./build/`:
 | `libwbcrypto.a` / `.so` | the shipped C-ABI runtime SDK (see [../include/wbcrypto.h](../include/wbcrypto.h)) |
 | `libwbprovision.a`   | host-only provisioning lib (adds the keygen surface; not shipped) |
 | `libsodium.a`        | vendored crypto dependency (built once)             |
-| `example`            | C integration demo (full lifecycle → links `libwbprovision.a`) |
+| `keywrap`            | C integration demo: the key-wrapping pattern, end to end (→ links `libwbprovision.a`) |
+| `wb_bench` / `wb_ladder` | benchmarks (see [Benchmarks](#benchmarks--what-does-o-mvll-actually-cost)) |
 | `test_*`             | one executable per test suite                        |
 
 Source layout: `src/wbaes/` (white-box compiler), `src/vm/` (the VM),
@@ -430,9 +431,9 @@ business in the test suite. It is likewise not registered with `ctest`.
 |---|---|---|
 | `vm_run` | `vm::Run` — the interpreter | `break_control_flow` only (HOT tuple) |
 | `data_copy` | the per-block DATA image copy | none — plain allocation + memmove |
-| `encrypt_block` | `wbc_encrypt_block` | flatten + constants + struct-access + strings |
-| `encrypt_ecb_4k` | `wbc_encrypt_ecb`, 4 KiB | as above, amortized over 256 blocks |
-| `crypt_ctr_4k` | `wbc_crypt_ctr`, 4 KiB | as above |
+| `encrypt_block` | `wbc_encrypt_block` (KAT primitive) | flatten + constants + struct-access + strings |
+| `wrap_key` / `unwrap_key` | `wbc_wrap_key` / `wbc_unwrap_key` — the real data path | as above |
+| `bulk_seal_4k` | `wbc_bulk_seal`, 4 KiB | none — conventional AEAD, not white-boxed |
 | `open` | `wbc_open` | flatten + **MBA** + constants + strings |
 | `kdf_argon2id` | `crypto_pwhash` alone | none — vendored libsodium |
 
@@ -456,42 +457,25 @@ you actually care about and drag their ratios towards a meaningless 1.00x:
   **not measurable**. Leave it alone.
 - `wbc_open` is ~97% Argon2id. Measured separately as `kdf_argon2id`.
 
-### "How long does my 5 MB payload take?" — `--bulk-mb`
+### "How long does my 5 MB payload take?"
 
-The metrics above are per-block *rates*. For an absolute wall-clock answer on a real
-payload, use `--bulk-mb N`, which encrypts N MiB, decrypts it back, and verifies the
-round trip:
+Run `./build/keywrap 5`. There is no `--bulk-mb` any more, because as of 2.0.0 there
+is no way to push a payload through the white-box: `wbc_encrypt_ecb` and
+`wbc_crypt_ctr` are gone, replaced by `wbc_wrap_key` / `wbc_unwrap_key` over exactly
+one session key.
 
-```sh
-./build/wb_bench --blob sealed.blob --pass demo --bulk-mb 5
-./scripts/bench_android.sh --bulk-mb 5          # same, on device, both builds
-```
+The cost model is therefore two terms, and only one of them scales:
 
-It is **off by default and it is slow** — the white-box runs at well under 1 MB/s,
-so budget roughly **25 s per MiB per leg** (measured on an arm64 dev host; ~2 min
-per leg for 5 MiB, and it does two legs). An ETA derived from the `crypt_ctr_4k`
-measurement is printed before it starts, so a multi-minute pass is not mistaken for
-a hang. Start with `--bulk-mb 1`.
+- **fixed:** `wrap_key` — two white-box blocks, ~0.5 ms, *regardless of payload size*;
+- **scaling:** `bulk_seal_4k` — conventional XChaCha20-Poly1305, ~GB/s.
 
-Two things worth knowing before you design around this:
+Measured end to end: a 5 MiB round trip is **~13 ms per leg**, against ~85 s if the
+payload itself went through the VM. `wb_bench`'s derived section prints the two terms
+as `per payload` so the split is visible rather than asserted.
 
-- **`wbc_crypt_ctr` is the only way to decrypt.** The white-box has no inverse
-  tables, so there is no decrypt primitive; CTR is its own inverse, which is what
-  gives you decryption at all. `wbc_encrypt_ecb` **cannot** decrypt.
-- **Decryption costs exactly the same as encryption** — both just generate keystream
-  and XOR. Both legs are timed so you can see that rather than take it on trust.
-
-If bulk throughput matters for your use case, do not push megabytes through the VM —
-wrap a key instead. The SDK ships the pieces (`wbc_random`, `wbc_bulk_seal`,
-`wbc_bulk_open`, `wbc_wipe`) and `examples/keywrap.c` is a runnable end-to-end
-version that times both paths; on a 1 MiB payload it round-trips in ~3 ms against
-~23 s straight through the VM. See the README's Performance section for the pattern
-and for what it does and does not protect (the session key is plaintext in memory
-for its lifetime).
-
-Do not pass `--bulk-mb` to `bench_android.sh` casually: cost multiplies by two legs
-× two builds × `--rounds`. The obfuscation ratio the A/B exists to measure is already
-covered by `crypt_ctr_4k`.
+Note the AEAD half is **not** white-box protected, and the session key is plaintext in
+memory for its lifetime — see the README's Performance section and
+[ANTI-TAMPER.md](ANTI-TAMPER.md) §4 for what that does and does not cost you.
 
 ### Reading `open - kdf`
 
