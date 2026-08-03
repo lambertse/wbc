@@ -82,22 +82,38 @@ if [ ! -f "$SODIUM_A" ] || [ "$(cat "$STAMP" 2>/dev/null || true)" != "$WANT" ];
     # 16-byte name field (at offset 8, right after the "!<arch>\n" magic): a
     # BSD/Mach-O archive names its symbol table "__.SYMDEF" (or "__.SYMDEF SORTED"),
     # a GNU one just "/". Apple's ld only understands the former, so a GNU/LLVM ar
-    # sneaking onto PATH is caught here instead of at link time.
+    # sneaking onto PATH is caught here instead of at link time. But see the
+    # extended-name note below before touching the comparison.
     # Scope note: this catches the wrong-archive-FORMAT case only. It does not catch
     # a format-valid archive whose member objects the system ld still dislikes —
     # that is what preferring /usr/bin/clang++ above is for.
     # NOTE: do NOT try to detect this with `ar t` — ar omits the special members
     # from its listing, so such a check silently never fires.
+    # IMPORTANT: the 16-byte name field is often NOT the literal name. BSD/Mach-O
+    # stores any name that is long or contains a space OUT OF LINE: the field
+    # reads "#1/<len>" and the real name occupies the first <len> bytes of the
+    # member data (offset 68 = 8 magic + 60 header). Apple's own ar does this for
+    # the symbol table — "#1/12" for "__.SYMDEF", "#1/20" for "__.SYMDEF SORTED"
+    # — so matching only a literal "__.SYMDEF" rejects the very archives this
+    # check exists to bless. Resolve the extended form before judging.
     if [ "$(uname -s)" = "Darwin" ]; then
         first_member=$(dd if="$SODIUM_A" bs=1 skip=8 count=16 2>/dev/null || true)
         case "$first_member" in
-            __.SYMDEF*) ;;  # BSD/Mach-O — good
+            '#1/'*)
+                ext_len=$(printf '%s' "${first_member#\#1/}" | tr -dc '0-9')
+                # Trailing NULs pad the name to the alignment; strip them.
+                first_member=$(dd if="$SODIUM_A" bs=1 skip=68 count="${ext_len:-0}" \
+                                  2>/dev/null | tr -d '\0' || true) ;;
+        esac
+        case "$first_member" in
+            __.SYMDEF*) ;;  # BSD/Mach-O — good (GNU names its table "/")
             *)
                 echo "ERROR: '$AR' produced a non-Mach-O archive ($SODIUM_A):" >&2
-                echo "       first member is '${first_member}', expected '__.SYMDEF'." >&2
+                echo "       symbol-table member is '${first_member}', expected '__.SYMDEF'." >&2
                 echo "       Apple's ld cannot read it ('archive member invalid control" >&2
-                echo "       bits'). A GNU/LLVM ar is shadowing Apple's on PATH. Retry:" >&2
-                echo "         HOST_AR=/usr/bin/ar $0 $*" >&2
+                echo "       bits'). A GNU/LLVM ar is probably shadowing Apple's on PATH." >&2
+                echo "       '$AR' is what was used; check 'which -a ar' and force a" >&2
+                echo "       different one with HOST_AR=/path/to/ar $0 $*" >&2
                 rm -f "$SODIUM_A" "$STAMP"
                 exit 1 ;;
         esac
