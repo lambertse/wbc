@@ -156,16 +156,31 @@ sees a generic interpreter, not AES.
 
 ### 4.1 Instruction set (`src/vm/isa.h`)
 
-A tiny 32-bit **register machine**, 16 registers, 19 opcodes — deliberately
+A tiny 32-bit **register machine**, 32 registers, 21 opcodes — deliberately
 generic (no crypto-specific ops):
 
 ```
 HALT  LDI  MOV  LDB  STB  XOR  AND  OR  ADD  SUB  NOT  SHL  SHR  PUSH  POP  JMP  JZ  JNZ  DECJNZ
+LDBI  STBI
 ```
 
 `LDB rd, rbase, roff` (`reg[rd] = data[reg[rbase]+reg[roff]]`) is the workhorse:
 a table lookup is just an indexed load. `SUB`/`NOT` exist to support MBA and
 opaque predicates.
+
+`LDBI rd, imm32, roff` / `STBI imm32, roff, rs` are the immediate-base forms.
+Every table lookup and scratch access in a compiled white-box has a *constant*
+base address, which otherwise cost a separate 6-byte `LDI RBASE, <const>` before
+each 4-byte access. Folding the base in replaces 10 bytes and 2 instructions with
+7 bytes and 1 — about 3k of the instructions per block were those `LDI`s.
+
+The register file is 32 wide (was 16) so the emitter can keep a column's four
+post-ShiftRows Tyi indices live across all four output lanes instead of
+recomputing them per lane. Note that the program preamble seeds **every**
+register with distinct non-zero garbage before setting the three real constants:
+that is a tamper property, not tidiness — a flipped register-operand byte can
+only change the computation if the two registers it selects between hold
+different values. See `tests/test_obf.cpp` (`TestRegisterSeeding`).
 
 ### 4.2 Harvard memory model (`src/vm/vm.h`)
 
@@ -195,7 +210,7 @@ DATA memory layout (constants in `src/vm/assembler.cpp`):
 
 1. **Serializes the table bank** into the DATA image at the offsets above.
 2. **Emits generic bytecode** that reproduces `wb_interp` step for step, using
-   fixed scratch registers. Each table lookup becomes `LDI base; LDB`; each
+   fixed scratch registers. Each table lookup becomes a single `LDBI`; each
    encoded byte-XOR becomes `XorNibble(...)` — a ~15-instruction sequence of
    shifts/ands/ors + two table lookups. The whole encryption is emitted
    straight-line (~thousands of instructions).
@@ -297,17 +312,29 @@ tamper-evident, without a separate MAC.
 `Unseal(blob, passphrase, out)`. Blob format (little-endian):
 
 ```
-magic "WBTS" | version | block_off | code_len | data_len | fw_root(8) |
-phys_to_op(256) | op_to_phys(256) | code[code_len] | sealed_data[data_len]
+magic "WBTS" | version(4) | salt(16) | nonce(24) |
+block_off(4) | code_len(4) | data_len(4) | fw_root(8) |
+phys_to_op(256) | op_to_phys(256) | code[code_len] |
+ciphertext[data_len + 16]
 ```
 
-- **Storage key** = a lightweight KDF (FNV hash of the passphrase ⊗ a domain
-  constant). *Not* a real PBKDF — see the threat model.
-- **Integrity binding (anti-tamper):** `LogicTag` = hash of the program *logic*
-  (`block_off`, `fw_root`, both opcode maps, the code). The table data is
-  stream-sealed under `storageKey ^ LogicTag`. So editing the code or the maps
-  changes the tag → the tables decrypt to garbage → wrong output. This is
-  anti-tamper *by binding*, not an authentication check you could bypass.
+- **Version** is currently **3**. `Unseal` rejects any other value outright
+  rather than trying to run it. v3 added the `LDBI`/`STBI` opcodes and widened
+  the register file, and because `kOpCount` feeds the interpreter fingerprint
+  (§5) it also changes the decode root — so a v2 blob would decode to garbage,
+  and refusing it is the only safe behaviour. **Blobs must be regenerated when
+  this number changes.** Covered by `tests/test_fw.cpp` (`TestVersionGate`).
+- **Storage key** = **Argon2id** over the passphrase and the random per-seal
+  salt, at libsodium's INTERACTIVE cost tier (mobile-appropriate; the SENSITIVE
+  tier would make `wbc_open` unusable on a phone). Each passphrase guess costs
+  one Argon2id evaluation, which is what defuses offline guessing. It accounts
+  for ~97% of `wbc_open`'s wall time.
+- **Integrity (anti-tamper):** the table image is sealed with
+  **XChaCha20-Poly1305**, with *everything before* `ciphertext` — the whole
+  header, both opcode maps and the code — passed as associated data. So a wrong
+  passphrase or any edit to the header, the maps or the code fails the AEAD tag
+  and the blob does not open at all. There is no separate MAC because the AEAD
+  is the MAC.
 
 A wrong passphrase (or a tampered blob) does **not** error — it yields a program
 that runs and produces wrong ciphertext, by design (no oracle for the attacker).

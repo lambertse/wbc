@@ -37,7 +37,11 @@ enum Reg : uint8_t {
     RS = 8, RT0 = 9, RT1 = 10, RT2 = 11, RMASK = 12,
     RM0 = 13, RM1 = 14,  // MBA scratch
     ROP = 15,            // opaque-predicate / junk scratch
+    // Four Tyi indices of the current column, held live across all four output
+    // lanes (kNumRegs was raised to 32 for these).
+    RI0 = 16, RI1 = 17, RI2 = 18, RI3 = 19,
 };
+static_assert(RI3 < kNumRegs, "register file too small for the Tyi index set");
 
 class Assembler {
 public:
@@ -53,8 +57,14 @@ public:
     // Every instruction begins with exactly one op(), so this is also where we
     // record instruction-span boundaries for the firmware encryptor.
     void op(Op o) {
-        if (instr_open_)
-            spans_.push_back({instr_start_, static_cast<uint32_t>(plain_.size()) - instr_start_});
+        if (instr_open_) {
+            uint32_t len = static_cast<uint32_t>(plain_.size()) - instr_start_;
+            // The decode schedule reseeds per instruction and its consumers assume
+            // instructions stay short; catch an over-long encoding here, at
+            // provisioning time, rather than as a mis-decode in the field.
+            if (len > kMaxInstrBytes) std::abort();
+            spans_.push_back({instr_start_, len});
+        }
         instr_start_ = static_cast<uint32_t>(plain_.size());
         instr_open_ = true;
         const auto& v = blinding_.variants[static_cast<int>(o)];
@@ -62,6 +72,9 @@ public:
         plain_.push_back(phys);
     }
     void b(uint8_t x) { plain_.push_back(x); }
+    // Exposed so the program preamble can seed the register file with
+    // deterministic garbage (same seed -> same program).
+    uint64_t NextRand() { return rng_.next(); }
     void i32(uint32_t v) {
         b(v & 0xFF); b((v >> 8) & 0xFF); b((v >> 16) & 0xFF); b((v >> 24) & 0xFF);
     }
@@ -69,6 +82,14 @@ public:
     void LDI(uint8_t rd, uint32_t imm) { op(Op::LDI); b(rd); i32(imm); }
     void LDB(uint8_t rd, uint8_t rbase, uint8_t roff) { op(Op::LDB); b(rd); b(rbase); b(roff); }
     void STB(uint8_t rbase, uint8_t roff, uint8_t rs) { op(Op::STB); b(rbase); b(roff); b(rs); }
+    // Operand order must match HLdbi/HStbi in handlers.cpp exactly; the decode
+    // stream is positional, so a mismatch computes a wrong address silently.
+    void LDBI(uint8_t rd, uint32_t base, uint8_t roff) {
+        op(Op::LDBI); b(rd); i32(base); b(roff);
+    }
+    void STBI(uint32_t base, uint8_t roff, uint8_t rs) {
+        op(Op::STBI); i32(base); b(roff); b(rs);
+    }
     void XOR(uint8_t rd, uint8_t ra, uint8_t rb) { op(Op::XOR); b(rd); b(ra); b(rb); }
     void AND(uint8_t rd, uint8_t ra, uint8_t rb) { op(Op::AND); b(rd); b(ra); b(rb); }
     void OR(uint8_t rd, uint8_t ra, uint8_t rb) { op(Op::OR); b(rd); b(ra); b(rb); }
@@ -120,11 +141,12 @@ public:
     }
 
     // ---- helpers -----------------------------------------------------------
-    void LoadByte(uint8_t rd, uint32_t addr) { LDI(RBASE, addr); LDB(rd, RBASE, RZERO); }
-    void StoreByte(uint32_t addr, uint8_t rs) { LDI(RBASE, addr); STB(RBASE, RZERO, rs); }
-    void Lookup(uint8_t rd, uint32_t rowBase, uint8_t ridx) {
-        LDI(RBASE, rowBase); LDB(rd, RBASE, ridx);
-    }
+    // All three bases are compile-time constants, so they fold into the access
+    // (LDBI/STBI) instead of costing a preceding `LDI RBASE, <const>`: 7 bytes
+    // and 1 instruction where it used to be 10 bytes and 2.
+    void LoadByte(uint8_t rd, uint32_t addr) { LDBI(rd, addr, RZERO); }
+    void StoreByte(uint32_t addr, uint8_t rs) { STBI(addr, RZERO, rs); }
+    void Lookup(uint8_t rd, uint32_t rowBase, uint8_t ridx) { LDBI(rd, rowBase, ridx); }
 
     // rDst = encoded XOR of encoded bytes in rA, rB via type-IV nibble tables.
     // The OR/AND index arithmetic is routed through the MBA emitters.
@@ -133,12 +155,12 @@ public:
         SHR(RT0, rA, 4); SHL(RT0, RT0, 4);
         SHR(RT1, rB, 4);
         EmitOr(RT2, RT0, RT1);
-        LDI(RBASE, baseHi); LDB(RT0, RBASE, RT2);   // hi nibble result
+        LDBI(RT0, baseHi, RT2);                     // hi nibble result
         // low plane: idx = ((a & 0xF) << 4) | (b & 0xF)
         EmitAnd(RT1, rA, RMASK); SHL(RT1, RT1, 4);
         EmitAnd(RT2, rB, RMASK);
         EmitOr(RT2, RT1, RT2);
-        LDI(RBASE, baseLo); LDB(RT1, RBASE, RT2);   // lo nibble result
+        LDBI(RT1, baseLo, RT2);                     // lo nibble result
         // combine
         SHL(RT0, RT0, 4);
         EmitOr(rDst, RT0, RT1);
@@ -177,7 +199,21 @@ Program AssembleWhiteBox(const wbaes::WhiteBox& wb, uint64_t seed, ObfOptions ob
     using wbaes::ShiftRowsSrc;
     Assembler a(seed, obf);
 
-    // Program preamble: constants (ROP seeds the opaque predicates).
+    // Program preamble.
+    //
+    // Every register is first seeded with a DISTINCT non-zero value, then the
+    // three that carry real constants are overwritten. This is a tamper property,
+    // not decoration: a flipped register-operand byte must change the
+    // computation, and it cannot if the two register indices happen to hold the
+    // same value. Before LDBI/STBI existed, RBASE was rewritten before every
+    // data access and so was reliably different from RZERO; now nothing writes
+    // it, and an unseeded file would leave a dozen registers all sitting at 0 —
+    // making a flip among them a silent no-op. tests/test_fw.cpp's byte-tamper
+    // cascade check is what catches this, and it did.
+    for (int r = 0; r < kNumRegs; ++r) {
+        uint32_t garbage = static_cast<uint32_t>(a.NextRand() | 0x80000001u);
+        a.LDI(static_cast<uint8_t>(r), garbage);
+    }
     a.LDI(RZERO, 0);
     a.LDI(RMASK, 0x0F);
     a.LDI(ROP, 0x9E3779B9u);
@@ -192,16 +228,24 @@ Program AssembleWhiteBox(const wbaes::WhiteBox& wb, uint64_t seed, ObfOptions ob
             a.StoreByte(kTmpOff + i, RVAL);
         }
         // per column / lane: gather 4 Tyi operands and fold them.
+        //
+        // The Tyi row index is tmp[ShiftRowsSrc(p)] * 4, which depends on the
+        // column but NOT on the output lane j — the four lanes read four
+        // consecutive bytes of the same row. Hoisting it out of the j loop turns
+        // 4 loads + 4 shifts per lane into 4 loads + 4 shifts per COLUMN, which
+        // is why RI0..RI3 exist: they hold the four indices live across all four
+        // lanes. Same computed function, ~1.3k fewer instructions per block.
+        const uint8_t idx[4] = {RI0, RI1, RI2, RI3};
         for (int c = 0; c < 4; ++c) {
+            for (int mm = 0; mm < 4; ++mm) {
+                int src = ShiftRowsSrc(4 * c + mm);
+                a.LoadByte(idx[mm], kTmpOff + src);        // tval
+                a.SHL(idx[mm], idx[mm], 2);                // tval * 4
+            }
             for (int j = 0; j < 4; ++j) {
                 const uint8_t opnd[4] = {RO0, RO1, RO2, RO3};
-                for (int mm = 0; mm < 4; ++mm) {
-                    int p = 4 * c + mm;
-                    int src = ShiftRowsSrc(p);
-                    a.LoadByte(RIDX, kTmpOff + src);       // tval
-                    a.SHL(RIDX, RIDX, 2);                  // tval * 4
-                    a.Lookup(opnd[mm], TyBase(m, p) + j, RIDX);
-                }
+                for (int mm = 0; mm < 4; ++mm)
+                    a.Lookup(opnd[mm], TyBase(m, 4 * c + mm) + j, idx[mm]);
                 a.XorNibble(RS, RO0, RO1, XrRow(m, c, j, 0, 0), XrRow(m, c, j, 0, 1));
                 a.XorNibble(RS, RS, RO2, XrRow(m, c, j, 1, 0), XrRow(m, c, j, 1, 1));
                 a.XorNibble(RS, RS, RO3, XrRow(m, c, j, 2, 0), XrRow(m, c, j, 2, 1));

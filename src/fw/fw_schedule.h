@@ -47,10 +47,18 @@ inline uint64_t UpdateKeyReg(uint64_t key_reg, uint32_t fold, uint32_t ip) {
 // re-mapping opcodes or patching this table changes `root` and breaks decode.
 // (Binding to actual handler machine code is possible but platform-specific;
 //  documented as future work in the project README's threat-model section.)
-inline constexpr std::array<uint8_t, vm::kOpCount> kInterpFingerprint = {
+// Declared as a deduced-size C array, NOT as std::array<uint8_t, kOpCount>: with
+// an explicit size, adding an opcode compiles cleanly and silently zero-fills the
+// new entries, quietly weakening the fingerprint. The deduced size plus the
+// static_assert below turns that into a build error.
+inline constexpr uint8_t kInterpFingerprint[] = {
     0x3B, 0x9A, 0xC4, 0x17, 0x52, 0xE8, 0x0D, 0x71, 0xBF, 0x2A,
     0x66, 0xD3, 0x48, 0x95, 0xFC, 0x81, 0x2E, 0x57, 0xA9,
+    0x6C, 0xF3,  // LDBI, STBI
 };
+static_assert(sizeof(kInterpFingerprint) == static_cast<size_t>(vm::kOpCount),
+              "kInterpFingerprint must have exactly one entry per opcode — add a "
+              "fresh constant for every new Op, do not let it zero-fill");
 
 // Bind decode to the interpreter: hash the fixed fingerprint + the live opcode
 // permutation into a 64-bit value folded into the root at open time.

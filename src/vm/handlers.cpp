@@ -42,6 +42,25 @@ void HStb(VMContext& ctx) {
         ctx.data[addr] = static_cast<uint8_t>(ctx.reg[rs] & 0xFF);
 }
 
+// Immediate-base variants. The operand fetch ORDER here is the contract with the
+// assembler's LDBI/STBI emitters — the decode stream is positional, so swapping
+// two operands does not fail to compile, it silently computes the wrong address.
+void HLdbi(VMContext& ctx) {
+    uint8_t rd = Rf(ctx);
+    uint32_t base = FetchImm32(ctx);
+    uint8_t roff = Rf(ctx);
+    uint32_t addr = base + ctx.reg[roff];
+    ctx.reg[rd] = (addr < ctx.data.size()) ? ctx.data[addr] : 0;
+}
+
+void HStbi(VMContext& ctx) {
+    uint32_t base = FetchImm32(ctx);
+    uint8_t roff = Rf(ctx), rs = Rf(ctx);
+    uint32_t addr = base + ctx.reg[roff];
+    if (addr < ctx.data.size())
+        ctx.data[addr] = static_cast<uint8_t>(ctx.reg[rs] & 0xFF);
+}
+
 void HXor(VMContext& ctx) {
     uint8_t rd = Rf(ctx), ra = Rf(ctx), rb = Rf(ctx);
     ctx.reg[rd] = ctx.reg[ra] ^ ctx.reg[rb];
@@ -143,6 +162,8 @@ const std::array<Handler, kOpCount>& Handlers() {
         t[static_cast<int>(Op::JZ)] = HJz;
         t[static_cast<int>(Op::JNZ)] = HJnz;
         t[static_cast<int>(Op::DECJNZ)] = HDecJnz;
+        t[static_cast<int>(Op::LDBI)] = HLdbi;
+        t[static_cast<int>(Op::STBI)] = HStbi;
         return t;
     }();
     return table;

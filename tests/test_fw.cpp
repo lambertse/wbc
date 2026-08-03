@@ -6,6 +6,7 @@
 #include <cmath>
 #include <utility>  // std::swap
 
+#include "storage/trusted_storage.h"
 #include "test_util.h"
 #include "vm/assembler.h"
 #include "vm/vm.h"
@@ -27,6 +28,31 @@ static double Entropy(const std::vector<uint8_t>& v) {
     for (int i = 0; i < 256; ++i)
         if (f[i]) { double p = double(f[i]) / v.size(); h -= p * std::log2(p); }
     return h;
+}
+
+// A v2 blob must be REJECTED by a v3 runtime, not mis-executed.
+//
+// v3 added the LDBI/STBI opcodes, which changed kOpCount, which changes the
+// interpreter fingerprint and hence the decode root — so v2 code decodes to
+// garbage under v3. The version check in trusted_storage.cpp is what turns that
+// into a clean WBC_ERR_FORMAT. This forges a v2 header from a real v3 blob
+// (byte 4 is the little-endian version word) and asserts Unseal declines it.
+static void TestVersionGate() {
+    Key128 key = test::FromHex<16>("000102030405060708090a0b0c0d0e0f");
+    auto wb = GenerateWhiteBox(key, 5, WBLevel::Internal);
+    vm::Program prog = vm::AssembleWhiteBox(*wb, 6, vm::ObfOptions::All());
+    std::vector<uint8_t> blob = storage::Seal(prog, "pw");
+
+    vm::Program out;
+    CHECK(storage::Unseal(blob, "pw", out));  // the real thing still opens
+
+    CHECK(blob.size() > 8);
+    CHECK(blob[4] == 3);  // current kVersion, little-endian at offset 4
+    std::vector<uint8_t> old = blob;
+    old[4] = 2;  // claim to be v2
+    vm::Program ignored;
+    CHECK(!storage::Unseal(old, "pw", ignored));
+    std::printf("  [version] a v2-stamped blob is refused by the v3 runtime\n");
 }
 
 int main() {
@@ -76,5 +102,6 @@ int main() {
     CHECK(prog.code != prog2.code);
     CHECK(RunBlock(prog2, pt) == ref);
 
+    TestVersionGate();
     return test::Report("test_fw");
 }

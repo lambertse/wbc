@@ -12,7 +12,11 @@ namespace storage {
 namespace {
 
 constexpr uint8_t kMagic[4] = {'W', 'B', 'T', 'S'};
-constexpr uint32_t kVersion = 2;  // v2: Argon2id + XChaCha20-Poly1305 AEAD.
+// v3: added the LDBI/STBI immediate-base opcodes and widened the register file to
+// 32. Both change how a code stream decodes (kOpCount feeds the interpreter
+// fingerprint, hence the decode root), so a v2 blob cannot be executed by a v3
+// runtime. Rejected on the version check below rather than mis-decoded.
+constexpr uint32_t kVersion = 3;
 
 // KDF cost. INTERACTIVE-class is the mobile-appropriate tier (a few MB..tens of
 // MB, sub-second on a phone); do NOT use the _SENSITIVE tier here (256MB+ /
