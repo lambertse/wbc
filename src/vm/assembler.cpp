@@ -7,6 +7,7 @@
 #include "obf/blinding.h"
 #include "wbaes/aes_tables.h"
 #include "wbaes/encodings.h"
+#include <cstdlib>
 
 namespace vm {
 
