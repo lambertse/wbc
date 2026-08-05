@@ -165,10 +165,11 @@ cmake "${BUILD_ARGS[@]}"
 # but exports its internals is the specific regression the CMake path guards
 # against and build.sh silently does not.
 SO="$OUT/libwbcrypto.so"
-NM=""; READELF=""
+NM=""; READELF=""; STRINGS=""
 for d in "$NDK"/toolchains/llvm/prebuilt/*/bin; do
     [ -x "$d/llvm-readelf" ] && READELF="$d/llvm-readelf"
     [ -x "$d/llvm-nm" ] && NM="$d/llvm-nm"
+    [ -x "$d/llvm-strings" ] && STRINGS="$d/llvm-strings"
 done
 
 if [ -f "$SO" ]; then
@@ -208,6 +209,48 @@ if [ -f "$SO" ]; then
     fi
 else
     say "no $SO (expected if --target selected something else)"
+fi
+
+# The static archive ships too (docs/BUILD.md), and it is the artifact that used
+# to leak: 402 host paths, all in .debug_str/.debug_line, because nothing stripped
+# it and the NDK toolchain puts -g on every compile line. -g0 + the POST_BUILD
+# strip in CMakeLists.txt close that; this asserts they took effect, in the same
+# spirit as the symbol check above. A leaked username and source layout is a
+# ship-blocker, so this die()s rather than warn()s.
+A="$OUT/libwbcrypto.a"
+if [ -f "$A" ]; then
+    say "artifact: $A ($(wc -c < "$A" | tr -d ' ') bytes)"
+    if [ -n "$STRINGS" ]; then
+        # Look for this machine's paths, not just a hardcoded /Users — $ROOT is
+        # what the prefix map is supposed to have rewritten to './'.
+        paths=$("$STRINGS" "$A" 2>/dev/null \
+                | grep -E "(^|[^a-zA-Z0-9_])(${ROOT}|${HOME}|/Users/|/home/)" \
+                | sort -u | head -20 || true)
+        if [ -n "$paths" ]; then
+            printf '%s\n' "$paths" | sed 's/^/        /' >&2
+            die "$A embeds host paths — -g0/-ffile-prefix-map did not take effect; do not ship this .a"
+        fi
+        say "path hygiene: OK (no host paths in $(basename "$A"))"
+
+        # Release only: Debug/RelWithDebInfo keep DWARF on purpose, and there the
+        # path check above is the whole point. This is the positive signal that
+        # -g0 took effect — a grep that passes on a stale or partially rebuilt
+        # tree is the false pass to guard against. DWARF was 46% of this archive,
+        # so the byte count printed above moves visibly when it is gone.
+        if [ "$TYPE" = "Release" ]; then
+            if "$STRINGS" "$A" 2>/dev/null | grep -q '\.debug_info'; then
+                warn "$A still contains DWARF sections — -g0 did not take effect"
+            else
+                say "debug info: OK (no DWARF sections)"
+            fi
+        else
+            say "debug info: DWARF kept (type=$TYPE); paths checked above"
+        fi
+    else
+        warn "llvm-strings not found under \$NDK — skipping the archive path/DWARF checks"
+    fi
+else
+    say "no $A (expected if --target selected something else)"
 fi
 
 cat <<EOF

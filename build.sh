@@ -91,6 +91,22 @@ CXXFLAGS=(-std=c++17 "$OPT_LEVEL" "${INCS[@]}" -Wall -Wextra -Wno-nullability-co
           -fvisibility=hidden -fvisibility-inlines-hidden
           -ffunction-sections -fdata-sections)
 
+# Host-path hygiene, mirroring CMakeLists.txt. This path leaks nothing today: it
+# passes no -g and compiles through relative paths, so neither DWARF nor the
+# __FILE__ strings in libsodium's asserts (this build sets no NDEBUG) carry an
+# absolute path. The map is here so the two build paths do not drift, and so that
+# EXTRA_CXXFLAGS="-g" — or an OPT_LEVEL carrying it — cannot quietly start
+# recording $PWD. Probed, not assumed: this script accepts whatever compiler it
+# discovers above, and the flag needs clang 10+ / gcc 8+.
+PATHMAP=()
+_probe='int main(void){return 0;}'
+if echo "$_probe" | "${CXXCMD[@]}" -x c++ "-ffile-prefix-map=$PWD=." -c -o /dev/null - 2>/dev/null \
+   && echo "$_probe" | "${CCCMD[@]}" -x c "-ffile-prefix-map=$PWD=." -c -o /dev/null - 2>/dev/null
+then
+    PATHMAP=("-ffile-prefix-map=$PWD=.")
+    CXXFLAGS+=("${PATHMAP[@]}")
+fi
+
 # Opt-in native-code obfuscation hook. Append extra compiler flags (e.g. an
 # LLVM pass-plugin like O-MVLL: EXTRA_CXXFLAGS="-fpass-plugin=/path/OMVLL.so").
 # Empty by default, so normal builds are unaffected. See docs/BUILD.md.
@@ -155,7 +171,10 @@ if [ ! -f "$SODIUM_A" ] && [ ${#ARCMD[@]} -ne 0 ]; then
     SOBJS=()
     while IFS= read -r c; do
         o="$BUILD/sodium/$(echo "$c" | tr '/.' '__').o"
+        # PATHMAP is repeated here deliberately: EXTRA_CXXFLAGS does not reach
+        # this compile, so the libsodium objects would otherwise miss the map.
         "${CCCMD[@]}" -O2 -fPIC -fvisibility=hidden -DCONFIGURED=1 \
+            ${PATHMAP[@]+"${PATHMAP[@]}"} \
             -I"$SODIUM_INC" -I"$SODIUM_INC/sodium" -c "$c" -o "$o"
         SOBJS+=("$o")
     done < <(find "$SODIUM_ROOT/src/libsodium" -name '*.c' | sort)

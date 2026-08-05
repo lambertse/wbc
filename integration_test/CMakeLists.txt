@@ -13,10 +13,12 @@
 #     cmake -S . -B build -DWBC_ROOT=/path/to/sdk
 #     cmake -S . -B build -DWBC_INCLUDE_DIR=/inc -DWBC_LIB_DIR=/libdir
 #
-# NOTE: use a libwbcrypto built for YOUR run target. The libwbcrypto.so committed at
-# ../build is an Android/aarch64 (bionic) build and will not load on a desktop glibc
-# host; rebuild the SDK for your platform (./build.sh) or point WBC_LIB_DIR at a native
-# build. Android: consume via the NDK toolchain / Gradle externalNativeBuild instead.
+# NOTE: use a libwbcrypto built for YOUR run target. No build output is committed —
+# ../build, ../build-android and ../build-host are all gitignored — so ../build holds
+# whatever your last ./build.sh produced. Pointing WBC_LIB_DIR at ../build-android
+# (an Android/aarch64 bionic build) and configuring for the host will fail on
+# architecture at link time: cross-compile this project too, with the NDK toolchain
+# file, or consume it via Gradle externalNativeBuild.
 
 cmake_minimum_required(VERSION 3.16)
 project(wbc_integration_test LANGUAGES CXX)

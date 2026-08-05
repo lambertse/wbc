@@ -35,6 +35,20 @@ path an extra `llvm-strip --remove-section=.comment` post-link step reaches the
 shipped `.so` (the NDK toolchain otherwise injects `-g`). Verify with
 `readelf --dyn-syms` (only `wbc_*`) and `nm` (no `GenerateWhiteBox`/`AesEncrypt*`).
 
+The static archive ships too, and for a while it did *not* get this treatment: the
+strip steps above only ever touched the `.so`, so `libwbcrypto.a` kept the DWARF
+the NDK's `-g` produced — 46% of its size, and with it the build machine's
+username and full source layout in `.debug_str`/`.debug_line`. Two flags close it,
+both directory-scope in `CMakeLists.txt` so they reach the libsodium objects as
+well as ours: `-g0` in Release (the fix), and `-ffile-prefix-map=<src>=.` for the
+configs that legitimately keep DWARF — which also covers `.rodata`, since a
+`Debug` build has no `NDEBUG` and libsodium's `assert()`s then bake `__FILE__` in.
+An archive-level `llvm-strip --strip-debug` backs this up on the NDK path
+(`--strip-debug`, never `--strip-all`: an archive's symbol table is what the
+consumer links against). `scripts/build_android.sh` asserts the result and fails
+the build if a host path survives, so this cannot regress silently. Verify by hand
+with `strings -a build-android/libwbcrypto.a | grep -E '/Users/|/home/'`.
+
 ## Option A — `build.sh` (recommended, no CMake needed)
 
 The script discovers a compiler automatically, in this order:

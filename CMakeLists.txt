@@ -23,6 +23,51 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 add_compile_options(-ffunction-sections -fdata-sections)
 
+# ---- host-path hygiene -----------------------------------------------------
+# libwbcrypto.a ships (docs/BUILD.md), and it used to carry the build machine's
+# absolute paths — 402 of them, username and full source layout included. They
+# were all in .debug_str/.debug_line, never .rodata: the NDK toolchain file
+# injects -g via CMAKE_<LANG>_FLAGS_INIT, and the strip step further down reaches
+# the .so only, so the archive kept its DWARF (46% of its size).
+#
+# Directory scope is the point. wbcrypto_static has no sources of its own — it
+# is an archive of OBJECT-library output — so target_compile_options on it is a
+# silent no-op. The flags must reach sodium_obj/wbvm_*_obj, and this call sits
+# above every add_library. It covers C (libsodium) as well as C++.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  # The actual fix. Release-only so Debug/RelWithDebInfo stay debuggable. Safe
+  # against the toolchain's -g: project options land after CMAKE_<LANG>_FLAGS.
+  add_compile_options(-g0)
+endif()
+# Sanitizes what the configs that KEEP DWARF record, and pre-empts the .rodata
+# variant — without NDEBUG, libsodium's asserts bake __FILE__ in, and
+# -ffile-prefix-map implies the macro half as well as the debug half.
+#
+# Map the source dir only: the build dir normally lives inside it (build-android/
+# does), so this already rewrites DW_AT_comp_dir. Adding both would leave two
+# overlapping maps whose precedence differs between clang and gcc.
+#
+# Every path below is quoted: a source or build directory containing a space
+# would otherwise split into two list elements, turn string(FIND) into a
+# three-argument error, and make the probe test a flag we never pass.
+set(_path_map "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.")
+string(FIND "${CMAKE_BINARY_DIR}" "${CMAKE_SOURCE_DIR}" _bin_under_src)
+if(NOT _bin_under_src EQUAL 0)
+  list(APPEND _path_map "-ffile-prefix-map=${CMAKE_BINARY_DIR}=.")
+endif()
+# Probed, not assumed: this file is the portable path, and the flag needs
+# clang 10+ / gcc 8+. Both languages, since libsodium is C.
+include(CheckCCompilerFlag)
+include(CheckCXXCompilerFlag)
+check_c_compiler_flag("-ffile-prefix-map=${CMAKE_SOURCE_DIR}=." HAVE_C_FILE_PREFIX_MAP)
+check_cxx_compiler_flag("-ffile-prefix-map=${CMAKE_SOURCE_DIR}=." HAVE_CXX_FILE_PREFIX_MAP)
+if(HAVE_C_FILE_PREFIX_MAP AND HAVE_CXX_FILE_PREFIX_MAP)
+  add_compile_options(${_path_map})
+else()
+  message(STATUS "compiler lacks -ffile-prefix-map; builds that keep DWARF will "
+                 "record host paths (Release is still covered by -g0)")
+endif()
+
 # ---- third-party dependency fetcher ----------------------------------------
 # third_party/fetch_deps.sh vendors deps into third_party/ (pinned + SHA256,
 # idempotent). CMake runs it at configure time so a fresh checkout never fails
@@ -171,6 +216,24 @@ if(CMAKE_STRIP)
     COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment
             $<TARGET_FILE:wbcrypto_shared>
     COMMENT "strip libwbcrypto.so (symbols, debug, .comment)")
+endif()
+# The archive ships too, so give it the same treatment. Redundant with -g0 above
+# and deliberately so: it holds even if a future toolchain re-injects -g in a
+# position that beats ours.
+#
+# --strip-debug, NEVER --strip-all: an archive is not linked, so its symbol table
+# is exactly what the consumer resolves against and --strip-all yields an
+# unlinkable .a. Gated on ANDROID because the long-option spelling is LLVM/GNU;
+# cctools strip on a macOS host build calls it -S and would fail the build.
+if(CMAKE_STRIP AND ANDROID AND CMAKE_BUILD_TYPE STREQUAL "Release")
+  add_custom_command(TARGET wbcrypto_static POST_BUILD
+    COMMAND ${CMAKE_STRIP} --strip-debug $<TARGET_FILE:wbcrypto_static>
+    COMMENT "strip libwbcrypto.a (debug sections only; symbols must survive)")
+  message(STATUS "archive strip: ${CMAKE_STRIP} --strip-debug")
+else()
+  # Announced because a silently skipped strip is invisible: -g0 has already
+  # removed the DWARF, so every downstream check still passes.
+  message(STATUS "archive strip: skipped (strip=${CMAKE_STRIP} android=${ANDROID} type=${CMAKE_BUILD_TYPE})")
 endif()
 
 # Host-only provisioning library (adds the keygen surface). Never shipped.
