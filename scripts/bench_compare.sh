@@ -32,6 +32,17 @@ CT_PLAIN=$(meta "$PLAIN" ct);          CT_OMVLL=$(meta "$OMVLL" ct)
 LBL_PLAIN=$(meta "$PLAIN" label);      LBL_OMVLL=$(meta "$OMVLL" label)
 : "${LBL_PLAIN:=plain}"; : "${LBL_OMVLL:=omvll}"
 
+# Same label on both sides means this is an A/A, not an A/B: the caller handed
+# over the same CSV twice (or two runs of the same build). Every ratio would be
+# exactly 1.00x and look like "obfuscation is free" — the most expensive kind of
+# wrong answer this script can produce. Refuse rather than print it.
+if [ "$LBL_PLAIN" = "$LBL_OMVLL" ]; then
+    echo "bench_compare: both inputs carry '# label=$LBL_PLAIN' — this is an A/A comparison, not an A/B." >&2
+    echo "               $PLAIN" >&2
+    echo "               $OMVLL" >&2
+    exit 1
+fi
+
 echo
 echo "=== wb_bench comparison: $LBL_PLAIN  vs  $LBL_OMVLL ==="
 echo "  blob geometry : code=$(meta "$PLAIN" code_len) B  data=$(meta "$PLAIN" data_len) B (copied per block)"

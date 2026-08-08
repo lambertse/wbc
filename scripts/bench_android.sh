@@ -236,9 +236,9 @@ run_one() {  # run_one <plain|omvll> <round> -> writes $OUT/raw-<label>-<round>.
 
 say "running $ROUNDS interleaved round(s), ${COOLDOWN}s cooldown between runs"
 for r in $(seq 1 "$ROUNDS"); do
-    for label in plain omvll; do
-        printf '    round %s/%s: %-5s ... ' "$r" "$ROUNDS" "$label"
-        run_one "$label" "$r" >/dev/null
+    for _label in plain omvll; do
+        printf '    round %s/%s: %-5s ... ' "$r" "$ROUNDS" "$_label"
+        run_one "$_label" "$r" >/dev/null
         printf 'ok\n'
         sleep "$COOLDOWN"
     done
@@ -246,7 +246,12 @@ done
 
 # ---- 7. reduce across rounds (best per metric) + compare --------------------
 reduce() {  # reduce <label> -> $OUT/bench-<label>.csv
-    local label="$1" dst="$OUT/bench-$label.csv"
+    # NB: two separate `local` statements. Bash expands ALL words of a single
+    # `local a=… b=$a` before performing any of the assignments, so a combined
+    # form would expand $label to whatever leaked out of the `for label in …`
+    # loop above (always "omvll") — silently comparing the omvll CSV to itself.
+    local label="$1"
+    local dst="$OUT/bench-$label.csv"
     # Keep, per metric, the WHOLE ROW from the round with the smallest min_ns —
     # the least thermally-degraded observation of that work. Carrying the whole row
     # (rather than a per-column minimum) keeps median/min/max/mb_s mutually

@@ -17,3 +17,4 @@ third_party/*.tgz
 third_party/omvll/*.tar.gz
 /build-host/
 /build-android/
+/build-bench-*/

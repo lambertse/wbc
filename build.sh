@@ -84,7 +84,6 @@ fi
 # its toolchain file; that mismatch does NOT contaminate the on-device A/B, which
 # builds both sides through CMake. Override for flag experiments:
 #   OPT_LEVEL=-O3 ./build.sh
-# and use scripts/bench_host_ab.sh to compare, rather than eyeballing two runs.
 OPT_LEVEL="${OPT_LEVEL:--O2}"
 INCS=(-Isrc -Iinclude -Itests "-I$SODIUM_INC")
 CXXFLAGS=(-std=c++17 "$OPT_LEVEL" "${INCS[@]}" -Wall -Wextra -Wno-nullability-completeness
