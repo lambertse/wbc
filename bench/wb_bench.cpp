@@ -1,7 +1,7 @@
 // wb_bench — throughput/latency benchmark for the shipped white-box runtime.
 //
 //   wb_bench --blob FILE [--pass P] [--min-time MS] [--reps N] [--open-reps N]
-//            [--csv] [--label TAG]
+//            [--csv] [--label TAG] [--only METRIC,...]
 //
 // Built twice from identical sources (O-MVLL plugin on / off) and compared, this
 // answers the question docs/ANTI-TAMPER.md poses but cannot currently verify:
@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -49,12 +50,10 @@ using bench::Measure;
 using bench::Result;
 
 // ---- KDF parameters ---------------------------------------------------------
-// MUST mirror src/storage/trusted_storage.cpp (kOpsLimit/kMemLimit/kKeyBytes/
-// kSaltBytes). Those live in an anonymous namespace and cannot be imported, so
-// they are duplicated here; if the seal's KDF tier ever changes, change it here
-// too or the `open - kdf` subtraction below silently stops being meaningful.
-constexpr unsigned long long kOpsLimit = crypto_pwhash_OPSLIMIT_INTERACTIVE;
-constexpr size_t kMemLimit = crypto_pwhash_MEMLIMIT_INTERACTIVE;
+// Taken from the blob being benchmarked, via storage::PeekTier +
+// storage::ParamsForTier. These used to be duplicated INTERACTIVE constants with
+// a comment warning they would drift; now that the cost is a per-blob tier, a
+// duplicate would not merely drift, it would time a KDF the blob does not use.
 constexpr size_t kKeyBytes = crypto_aead_xchacha20poly1305_ietf_KEYBYTES;  // 32
 constexpr size_t kSaltBytes = crypto_pwhash_SALTBYTES;                    // 16
 
@@ -93,7 +92,7 @@ bool ParseHex16(const std::string& s, std::array<uint8_t, 16>& out) {
 int Usage() {
     std::fprintf(stderr,
                  "usage: wb_bench --blob FILE [--pass P] [--min-time MS] [--reps N]\n"
-                 "                [--open-reps N] [--csv] [--label TAG]\n"
+                 "                [--open-reps N] [--csv] [--label TAG] [--only M,...]\n"
                  "\n"
                  "  --blob FILE    sealed blob to benchmark (required; generate with\n"
                  "                 scripts/gen_blob.sh on the HOST, never on device)\n"
@@ -102,9 +101,26 @@ int Usage() {
                  "  --reps N       timed batches per metric (default 7)\n"
                  "  --open-reps N  reps for wbc_open / the KDF (default 5)\n"
                  "  --csv          machine-readable output for scripts/bench_compare.sh\n"
-                 "  --label TAG    tag echoed into the output (e.g. plain / omvll)\n");
+                 "  --label TAG    tag echoed into the output (e.g. plain / omvll)\n"
+                 "  --only LIST    comma-separated metric names to run (default: all).\n"
+                 "                 e.g. --only open,kdf — for a second pass over a blob\n"
+                 "                 sealed at a different KDF tier, where the\n"
+                 "                 tier-independent metrics would just be repeated work.\n"
+                 "                 An unknown name is an error, not a silent no-op.\n");
     return 2;
 }
+
+// Metric selection. Empty set = run everything, which is the default and what
+// every existing caller gets.
+std::set<std::string> g_only;
+bool Want(const char* name) { return g_only.empty() || g_only.count(name) != 0; }
+
+// Every metric name this binary can emit — used to reject a typo in --only
+// rather than silently producing a CSV with a metric missing, which downstream
+// would read as "that metric did not exist in this build".
+const char* const kAllMetrics[] = {"vm_run",     "data_copy",    "encrypt_block",
+                                   "wrap_key",   "unwrap_key",   "bulk_seal_4k",
+                                   "open",       "kdf"};
 
 }  // namespace
 
@@ -124,10 +140,34 @@ int main(int argc, char** argv) {
         else if (a == "--reps") reps = std::atoi(next().c_str());
         else if (a == "--open-reps") open_reps = std::atoi(next().c_str());
         else if (a == "--csv") csv = true;
+        else if (a == "--only") {
+            std::string list = next();
+            for (size_t p = 0; p < list.size();) {
+                size_t c = list.find(',', p);
+                if (c == std::string::npos) c = list.size();
+                std::string m = list.substr(p, c - p);
+                if (!m.empty()) g_only.insert(m);
+                p = c + 1;
+            }
+            if (g_only.empty()) {
+                std::fprintf(stderr, "--only needs at least one metric name\n");
+                return Usage();
+            }
+        }
         else if (a == "-h" || a == "--help") return Usage();
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return Usage(); }
     }
     if (blob_path.empty()) return Usage();
+    for (const std::string& m : g_only) {
+        bool known = false;
+        for (const char* k : kAllMetrics) if (m == k) { known = true; break; }
+        if (!known) {
+            std::fprintf(stderr, "wb_bench: --only: unknown metric '%s'. Known:", m.c_str());
+            for (const char* k : kAllMetrics) std::fprintf(stderr, " %s", k);
+            std::fprintf(stderr, "\n");
+            return 2;
+        }
+    }
     if (reps < 1) reps = 1;
     if (open_reps < 1) open_reps = 1;
     if (min_ms < 1.0) min_ms = 1.0;
@@ -149,6 +189,20 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "wb_bench: %s is empty\n", blob_path.c_str());
         return 1;
     }
+
+    // Which KDF this blob actually uses. Read from the header, so the `kdf`
+    // metric below times the same derivation `open` pays for instead of a
+    // hardcoded tier. A stale blob from an older format version fails here with
+    // a clear message rather than as a confusing unseal failure.
+    storage::KdfTier tier;
+    if (!storage::PeekTier(blob.data(), blob.size(), tier)) {
+        std::fprintf(stderr,
+                     "wb_bench: %s is not a readable v4 WBTS blob (regenerate it "
+                     "with scripts/gen_blob.sh)\n",
+                     blob_path.c_str());
+        return 1;
+    }
+    const storage::KdfParams kdf_params = storage::ParamsForTier(tier);
 
     // Internal path: unseal once into a vm::Program so vm::Run can be timed
     // directly, separately from the SDK wrapper around it.
@@ -209,7 +263,7 @@ int main(int argc, char** argv) {
     uint64_t sink = 0;  // folds every result so the work cannot be elided
     std::vector<Result> results;
 
-    {   // Interpreter alone. vm.cpp/handlers.cpp are the HOT tuple in
+    if (Want("vm_run")) {   // Interpreter alone. vm.cpp/handlers.cpp are the HOT tuple in
         // omvll_config.py: break_control_flow only, heavy passes excluded.
         std::array<uint8_t, 16> blk = pt;
         results.push_back(Measure("vm_run", min_ms, reps, 16, 0, true, sink, [&](uint64_t n) {
@@ -221,7 +275,7 @@ int main(int argc, char** argv) {
             return acc;
         }));
     }
-    {   // The DATA image copy vm::Run performs on EVERY block (ctx.data =
+    if (Want("data_copy")) {   // The DATA image copy vm::Run performs on EVERY block (ctx.data =
         // prog.data in vm.cpp). At data_len ~400 KB this is a large slice of
         // vm_run, and it is plain allocation + libc memmove, which O-MVLL never
         // touches — so it dilutes the interpreter's ratio towards 1.0x exactly as
@@ -241,7 +295,7 @@ int main(int argc, char** argv) {
                 return acc;
             }));
     }
-    {   // Same work through the C ABI. wbcrypto.cpp is sensitive but NOT hot, so
+    if (Want("encrypt_block")) {   // Same work through the C ABI. wbcrypto.cpp is sensitive but NOT hot, so
         // this wrapper gets flatten_functions + obfuscate_constants +
         // obfuscate_struct_access. The delta against vm_run is the SDK-glue cost.
         uint8_t in[16], out[16];
@@ -256,7 +310,7 @@ int main(int argc, char** argv) {
             return acc;
         }));
     }
-    {   // wrap_key: the ENTIRE white-box cost of a real use, and the only one that
+    if (Want("wrap_key") || Want("unwrap_key")) {   // wrap_key: the ENTIRE white-box cost of a real use, and the only one that
         // matters — it is two blocks plus a random IV regardless of how big the
         // payload is. Not byte-rated on purpose: a MB/s figure over 32 bytes
         // would invite exactly the "so N MB takes N/rate" extrapolation that the
@@ -285,7 +339,7 @@ int main(int argc, char** argv) {
                 return acc;
             }));
     }
-    {   // The other half of the only path: conventional AEAD over the payload.
+    if (Want("bulk_seal_4k")) {   // The other half of the only path: conventional AEAD over the payload.
         // This is what actually scales with data, and it is NOT white-box
         // protected — see the caveat in wbcrypto.h.
         uint8_t sk[WBC_SESSION_KEY_BYTES];
@@ -305,10 +359,11 @@ int main(int argc, char** argv) {
             }));
         wbc_wipe(sk, sizeof sk);
     }
-    {   // Cold gate path. trusted_storage.cpp gets the heaviest pass set
-        // (flatten + MBA + opaque constants + string encoding), but Argon2id
-        // dominates the wall clock, so this number alone hides that cost — hence
-        // the kdf_argon2id line below and the `open - kdf` derivation.
+    if (Want("open")) {   // Cold gate path. trusted_storage.cpp gets the heaviest pass set
+        // (flatten + MBA + opaque constants + string encoding). At the high tier
+        // Argon2id dominates the wall clock and this number alone hides that
+        // cost — hence the `kdf` line below and the `open - kdf` derivation. At
+        // the `none` tier there is no KDF worth the name, so `open` IS the loader.
         results.push_back(Measure("open", min_ms, open_reps, 0, 1, true, sink, [&](uint64_t n) {
             uint64_t acc = 0;
             for (uint64_t i = 0; i < n; ++i) {
@@ -320,18 +375,39 @@ int main(int argc, char** argv) {
             return acc;
         }));
     }
-    {   // The KDF alone, same parameters as the seal. Vendored libsodium is not
-        // in _SENSITIVE_MODULES, so this is identical in both builds and can be
-        // subtracted out to isolate the obfuscated loader.
+    if (Want("kdf")) {   // The KDF alone, whichever one THIS blob's tier selects. Vendored
+        // libsodium is not in _SENSITIVE_MODULES, so this is identical in both
+        // builds and can be subtracted out to isolate the obfuscated loader.
+        //
+        // The metric is always emitted, under the same name at every tier, even
+        // though the `none` tier's HKDF is microseconds. Do NOT skip it: the
+        // noise floor in scripts/bench_compare.sh is
+        // `min[open] - min[kdf]`, and awk reads a missing key as 0 — an absent
+        // row would silently turn that into the whole of `open` and print a
+        // confident, meaningless "loader work" figure.
         uint8_t salt[kSaltBytes] = {0};
         uint8_t key[kKeyBytes] = {0};
-        results.push_back(Measure("kdf_argon2id", min_ms, open_reps, 0, 1, true, sink, [&](uint64_t n) {
+        results.push_back(Measure("kdf", min_ms, open_reps, 0, 1, true, sink, [&](uint64_t n) {
             uint64_t acc = 0;
             for (uint64_t i = 0; i < n; ++i) {
                 salt[0] = static_cast<uint8_t>(i);
-                if (crypto_pwhash(key, sizeof key, pass.data(), pass.size(), salt, kOpsLimit,
-                                  kMemLimit, crypto_pwhash_ALG_ARGON2ID13) != 0)
+                if (tier == storage::KdfTier::kNone) {
+                    uint8_t prk[crypto_kdf_hkdf_sha256_KEYBYTES];
+                    if (crypto_kdf_hkdf_sha256_extract(
+                            prk, salt, sizeof salt,
+                            reinterpret_cast<const unsigned char*>(pass.data()),
+                            pass.size()) != 0)
+                        return acc;
+                    // Same info string as storage::DeriveKey; the cost does not
+                    // depend on its contents, only its presence.
+                    if (crypto_kdf_hkdf_sha256_expand(key, sizeof key, "WBTS-v4-seal-key",
+                                                      16, prk) != 0)
+                        return acc;
+                } else if (crypto_pwhash(key, sizeof key, pass.data(), pass.size(), salt,
+                                         kdf_params.ops, kdf_params.mem,
+                                         crypto_pwhash_ALG_ARGON2ID13) != 0) {
                     return acc;
+                }
                 acc += key[0];
             }
             return acc;
@@ -350,6 +426,9 @@ int main(int argc, char** argv) {
     if (csv) {
         std::printf("# label=%s\n", label.c_str());
         std::printf("# ct=%s\n", ct_hex.c_str());
+        // The tier decides what `open` and `kdf` mean, so it belongs next to the
+        // ciphertext as part of "which blob produced these numbers".
+        std::printf("# kdf_tier=%s\n", storage::TierName(tier));
         std::printf("# code_len=%zu\n", prog.code.size());
         std::printf("# data_len=%zu\n", prog.data.size());
         std::printf("# block_off=%u\n", prog.block_off);
@@ -369,6 +448,15 @@ int main(int argc, char** argv) {
     std::printf("wb_bench (%s) — %s\n", label.c_str(), wbc_version());
     std::printf("  blob      : %s\n", blob_path.c_str());
     std::printf("  ct        : %s\n", ct_hex.c_str());
+    if (tier == storage::KdfTier::kNone) {
+        std::printf("  kdf tier  : %s (HKDF-SHA256 — `open` is essentially all loader)\n",
+                    storage::TierName(tier));
+    } else {
+        std::printf("  kdf tier  : %s (Argon2id %zu MiB / %llu passes — expect it to "
+                    "dominate `open`)\n",
+                    storage::TierName(tier), kdf_params.mem / (1024 * 1024),
+                    kdf_params.ops);
+    }
     // data_len is a PER-BLOCK cost, not a one-off: vm::Run copies the whole DATA
     // image into the context on every block (see ctx.data = prog.data in vm.cpp).
     std::printf("  geometry  : code=%zu B  data=%zu B (copied per block)  block_off=%u\n",
@@ -414,7 +502,7 @@ int main(int argc, char** argv) {
         if (r.name == "vm_run") vm = &r;
         if (r.name == "data_copy") copy = &r;
         if (r.name == "open") open = &r;
-        if (r.name == "kdf_argon2id") kdf = &r;
+        if (r.name == "kdf") kdf = &r;
         if (r.name == "wrap_key") wrap = &r;
         if (r.name == "bulk_seal_4k") seal = &r;
     }
@@ -450,10 +538,36 @@ int main(int argc, char** argv) {
         const double diff = open->min_ns - kdf->min_ns;
         const double margin =
             2.0 * std::max(open->median_ns - open->min_ns, kdf->median_ns - kdf->min_ns);
+        const char* kdf_name =
+            tier == storage::KdfTier::kNone ? "HKDF" : "Argon2id";
         std::printf("    open - kdf         : ");
         if (diff > margin) {
-            std::printf("%.2f ms  (loader work; Argon2id is %.1f%% of open)\n", diff / 1e6,
+            std::printf("%.2f ms  (loader work; %s is %.1f%% of open)\n", diff / 1e6, kdf_name,
                         100.0 * kdf->min_ns / open->min_ns);
+            if (tier == storage::KdfTier::kNone) {
+                // At this tier the KDF is microseconds, so the subtraction is
+                // well-conditioned for the first time and `open` finally reports
+                // the loader itself: the header parse and the ~400 KB AEAD
+                // decrypt. That is the number to watch when tuning the loader —
+                // it is unmeasurable at the Argon2id tiers.
+                std::printf("                         At tier `none` this IS the loader: header "
+                            "parse plus\n");
+                std::printf("                         the %zu KB AEAD decrypt of the table bank.\n",
+                            prog.data.size() / 1024);
+            } else {
+                // Clearing the margin is NOT enough to make this the loader at an
+                // Argon2id tier. `open` and `kdf` each allocate and fault in a
+                // 16/64 MiB arena in a different context, so the difference
+                // carries an allocation artifact that no amount of sampling
+                // removes -- measured here, it overstates the loader several-fold
+                // against a tier-`none` run of the same blob geometry. Treat it as
+                // an upper bound and get the real figure from --kdf light.
+                std::printf("                         UPPER BOUND, not the loader: the two "
+                            "measurements\n");
+                std::printf("                         fault in the Argon2 arena differently. Re-seal "
+                            "at\n");
+                std::printf("                         --kdf light for the loader's real cost.\n");
+            }
         } else {
             // The honest answer: the flattened + MBA'd loader in
             // trusted_storage.cpp is too cheap to resolve through a ~200 ms KDF.
@@ -464,9 +578,9 @@ int main(int argc, char** argv) {
             // the difference trustworthy. The bound is the deliverable, and it is
             // the answer that matters: heavy passes here are affordable.
             std::printf("NOT RESOLVABLE (< %.2f ms)\n", margin / 1e6);
-            std::printf("                         Argon2id is ~%.1f%% of open. The difference "
+            std::printf("                         %s is ~%.1f%% of open. The difference "
                         "(%.2f ms) is\n",
-                        100.0 * kdf->min_ns / open->min_ns, diff / 1e6);
+                        kdf_name, 100.0 * kdf->min_ns / open->min_ns, diff / 1e6);
             std::printf("                         inside the sampling margin (%.2f ms), so it "
                         "is not a\n",
                         margin / 1e6);

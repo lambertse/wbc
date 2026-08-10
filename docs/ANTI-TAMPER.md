@@ -38,9 +38,12 @@ Build via the NDK cross-compile in [BUILD.md](BUILD.md) (Option C). Benchmark
 It reports the plugin's cost per surface, which is what tells you whether the
 hot/cold split in `omvll_config.py` is actually working — see
 [BUILD.md § Benchmarks](BUILD.md#benchmarks--what-does-o-mvll-actually-cost).
-Note that `wbc_open`'s cost is ~97% Argon2id, so the obfuscated loader there is
-reported as a bound rather than a value; the practical upshot is that heavy passes
-on the cold gate code are affordable.
+Note that `wbc_open`'s cost is dominated by the blob's KDF tier — ~96-99% of it at
+`--kdf medium`/`heavy` — so the obfuscated loader there is reported as a bound
+rather than a value; the practical upshot is that heavy passes on the cold gate
+code are affordable. Re-seal at `--kdf light` and the loader becomes directly
+measurable (~1 ms), which is the honest way to check that claim rather than
+inferring it from a bound. See [ARCHITECTURE §6.1](ARCHITECTURE.md).
 
 ## 2. Anti-DBI / anti-tamper — `src/rt/anti_tamper.*` (P3)
 

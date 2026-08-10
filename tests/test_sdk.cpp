@@ -16,7 +16,11 @@ int main() {
 
     // seal + open
     uint8_t* blob = nullptr; size_t blen = 0;
-    CHECK(wbc_seal_key(key.data(), "pw", 42, /*hardened=*/1, &blob, &blen) == WBC_OK);
+    // Most of this file exercises the C ABI, not the KDF, so it seals at
+    // WBC_KDF_NONE to keep the suite fast. The tier itself is covered
+    // explicitly (all three, plus rejection of an invalid one) further down.
+    CHECK(wbc_seal_key(key.data(), "pw", 42, /*hardened=*/1, WBC_KDF_NONE, &blob,
+                       &blen) == WBC_OK);
     CHECK(blob != nullptr && blen > 0);
 
     wbc_ctx* ctx = nullptr;
@@ -51,7 +55,7 @@ int main() {
     // salt/nonce are random per seal -> same key+pass => different blob bytes.
     {
         uint8_t* blob2 = nullptr; size_t blen2 = 0;
-        CHECK(wbc_seal_key(key.data(), "pw", 42, 1, &blob2, &blen2) == WBC_OK);
+        CHECK(wbc_seal_key(key.data(), "pw", 42, 1, WBC_KDF_NONE, &blob2, &blen2) == WBC_OK);
         CHECK(blen2 == blen);
         CHECK(std::memcmp(blob, blob2, blen) != 0);
         // ...but it still opens and encrypts identically.
@@ -64,10 +68,10 @@ int main() {
     }
 
     // NULL passphrase (documented as "treated as empty") round-trips through
-    // the Argon2id KDF and unseals to the correct FIPS vector.
+    // the KDF and unseals to the correct FIPS vector.
     {
         uint8_t* nblob = nullptr; size_t nlen = 0;
-        CHECK(wbc_seal_key(key.data(), nullptr, 7, 1, &nblob, &nlen) == WBC_OK);
+        CHECK(wbc_seal_key(key.data(), nullptr, 7, 1, WBC_KDF_NONE, &nblob, &nlen) == WBC_OK);
         wbc_ctx* nctx = nullptr;
         CHECK(wbc_open(nblob, nlen, nullptr, &nctx) == WBC_OK);
         uint8_t nct[16];
@@ -189,9 +193,66 @@ int main() {
         std::printf("  [wrap] corrupted wrapped key -> WBC_ERR_AUTH from the AEAD\n");
     }
 
+    // ---- KDF tiers ---------------------------------------------------------
+    // Every tier must seal, report itself, and open to the same ciphertext: the
+    // tier changes ONLY the cost of deriving the seal key, never the white-box.
+    // (WBC_KDF_HIGH here is the slow one — one Argon2id seal plus one open.)
+    {
+        const wbc_kdf_tier tiers[] = {WBC_KDF_NONE, WBC_KDF_LOW, WBC_KDF_HIGH};
+        for (wbc_kdf_tier t : tiers) {
+            uint8_t* tb = nullptr; size_t tl = 0;
+            CHECK(wbc_seal_key(key.data(), "pw", 42, 1, t, &tb, &tl) == WBC_OK);
+
+            // The tier is readable from the header without a passphrase and
+            // without paying the KDF.
+            wbc_kdf_tier got = WBC_KDF_HIGH;
+            CHECK(wbc_blob_kdf_tier(tb, tl, &got) == WBC_OK);
+            CHECK(got == t);
+
+            wbc_ctx* tc = nullptr;
+            CHECK(wbc_open(tb, tl, "pw", &tc) == WBC_OK);
+            uint8_t tct[16];
+            CHECK(wbc_encrypt_block(tc, pt.data(), tct) == WBC_OK);
+            CHECK(std::memcmp(tct, ref.data(), 16) == 0);
+
+            // A downgrade is not an oracle: the tier lives in the AEAD's
+            // associated data, so rewriting it changes both the derived key and
+            // the authenticated data and the tag fails. Stamp a *valid* other
+            // tier so this tests the AD binding, not the range check.
+            {
+                std::vector<uint8_t> d(tb, tb + tl);
+                d[8] = static_cast<uint8_t>(t == WBC_KDF_NONE ? WBC_KDF_LOW : WBC_KDF_NONE);
+                wbc_ctx* dc = nullptr;
+                CHECK(wbc_open(d.data(), d.size(), "pw", &dc) == WBC_ERR_FORMAT);
+                CHECK(dc == nullptr);
+            }
+
+            // An out-of-range tier is refused outright, before any derivation.
+            {
+                std::vector<uint8_t> bad(tb, tb + tl);
+                bad[8] = 0x7F;
+                wbc_ctx* bc = nullptr;
+                CHECK(wbc_open(bad.data(), bad.size(), "pw", &bc) == WBC_ERR_FORMAT);
+                wbc_kdf_tier ignored;
+                CHECK(wbc_blob_kdf_tier(bad.data(), bad.size(), &ignored) == WBC_ERR_FORMAT);
+            }
+
+            wbc_close(tc); wbc_free(tb);
+        }
+        std::printf("  [kdf] all 3 tiers seal/report/open; downgrade and bad tier refused\n");
+    }
+
     // error paths.
     CHECK(wbc_open(blob, 3, "pw", &ctx) == WBC_ERR_FORMAT);
-    CHECK(wbc_seal_key(nullptr, "pw", 0, 1, &blob, &blen) == WBC_ERR_ARG);
+    CHECK(wbc_seal_key(nullptr, "pw", 0, 1, WBC_KDF_NONE, &blob, &blen) == WBC_ERR_ARG);
+    // An unknown tier must not be sealable in the first place.
+    {
+        uint8_t* xb = nullptr; size_t xl = 0;
+        CHECK(wbc_seal_key(key.data(), "pw", 0, 1, static_cast<wbc_kdf_tier>(99), &xb,
+                           &xl) == WBC_ERR_ARG);
+        CHECK(xb == nullptr);
+    }
+    CHECK(wbc_blob_kdf_tier(blob, 3, nullptr) == WBC_ERR_ARG);
 
     wbc_close(ctx); wbc_free(blob);
     return test::Report("test_sdk");

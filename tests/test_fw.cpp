@@ -41,18 +41,31 @@ static void TestVersionGate() {
     Key128 key = test::FromHex<16>("000102030405060708090a0b0c0d0e0f");
     auto wb = GenerateWhiteBox(key, 5, WBLevel::Internal);
     vm::Program prog = vm::AssembleWhiteBox(*wb, 6, vm::ObfOptions::All());
-    std::vector<uint8_t> blob = storage::Seal(prog, "pw");
+    // kNone: this test is about the version gate, not the KDF cost.
+    std::vector<uint8_t> blob = storage::Seal(prog, "pw", storage::KdfTier::kNone);
 
     vm::Program out;
     CHECK(storage::Unseal(blob, "pw", out));  // the real thing still opens
 
-    CHECK(blob.size() > 8);
-    CHECK(blob[4] == 3);  // current kVersion, little-endian at offset 4
+    CHECK(blob.size() > 12);
+    CHECK(blob[4] == 4);  // current kVersion, little-endian at offset 4
     std::vector<uint8_t> old = blob;
-    old[4] = 2;  // claim to be v2
+    old[4] = 3;  // claim to be v3
     vm::Program ignored;
     CHECK(!storage::Unseal(old, "pw", ignored));
-    std::printf("  [version] a v2-stamped blob is refused by the v3 runtime\n");
+    // v4 inserted kdf_tier between version and salt, so every later field moved.
+    // A v3 blob's salt sits where v4 reads the tier — it MUST be refused rather
+    // than reinterpreted, which is what makes the hard cut safe.
+    std::printf("  [version] a v3-stamped blob is refused by the v4 runtime\n");
+
+    // The tier is at offset 8 and must round-trip through PeekTier without a
+    // passphrase or any derivation.
+    storage::KdfTier peeked = storage::KdfTier::kHigh;
+    CHECK(storage::PeekTier(blob.data(), blob.size(), peeked));
+    CHECK(peeked == storage::KdfTier::kNone);
+    // PeekTier must refuse a truncated header rather than read past it.
+    CHECK(!storage::PeekTier(blob.data(), 11, peeked));
+    std::printf("  [version] PeekTier reports the tier and refuses a short header\n");
 }
 
 int main() {

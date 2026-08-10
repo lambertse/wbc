@@ -128,7 +128,10 @@ WBVM_ALWAYS_INLINE uint32_t FetchImm32(VMContext& ctx) {
 //   * reuse the buffer and keep restoring, saving only the allocation — no
 //     measurable gain at all, since the copy dominates and the allocator was
 //     already recycling the same block.
-// The copy is ~3% of Run (`data_copy` in wb_bench proves it). Leave it alone.
+// The copy's share of Run is device-dependent — ~4% on an aarch64 Linux host but
+// ~30% on an arm64 phone (`data_copy` in wb_bench prints the live figure; an
+// earlier "~3%" here was a host measurement quoted as if universal). Either way
+// both removals above were measured and rejected: leave it alone.
 std::array<uint8_t, 16> Run(const Program& prog, const std::array<uint8_t, 16>& in);
 
 }  // namespace vm

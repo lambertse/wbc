@@ -30,7 +30,9 @@ int main() {
 
     auto wb = GenerateWhiteBox(key, 12345, WBLevel::Internal);
     vm::Program prog = vm::AssembleWhiteBox(*wb, 999, vm::ObfOptions::All());
-    std::vector<uint8_t> blob = storage::Seal(prog, pass);
+    // kNone keeps this suite fast; what it asserts (key absence, AEAD binding,
+    // salt uniqueness) is tier-independent. tests/test_sdk.cpp covers the tiers.
+    std::vector<uint8_t> blob = storage::Seal(prog, pass, storage::KdfTier::kNone);
 
     // (1) seal -> unseal -> run == AES.
     vm::Program un;
@@ -53,9 +55,12 @@ int main() {
     // associated data) -> authentication fails, Unseal returns false.
     {
         std::vector<uint8_t> t = blob;
-        // v2 header up to start of code: magic(4)+version(4)+salt(16)+nonce(24)+
-        // block_off(4)+code_len(4)+data_len(4)+fw_root(8)+phys(256)+op(256).
-        size_t code_off = 4 + 4 + 16 + 24 + 4 + 4 + 4 + 8 + 256 + 256;
+        // v4 header up to start of code: magic(4)+version(4)+kdf_tier(4)+
+        // salt(16)+nonce(24)+block_off(4)+code_len(4)+data_len(4)+fw_root(8)+
+        // phys(256)+op(256). The kdf_tier(4) term is new in v4 — miss it and this
+        // flips a byte inside op_to_phys instead, which still fails the tag and so
+        // would pass for the wrong reason.
+        size_t code_off = 4 + 4 + 4 + 16 + 24 + 4 + 4 + 4 + 8 + 256 + 256;
         t[code_off + 7] ^= 0x01;
         vm::Program tp;
         CHECK(!storage::Unseal(t, pass, tp));
@@ -78,7 +83,7 @@ int main() {
     // (3d) same program + passphrase sealed twice -> different bytes (random
     // salt/nonce), but both unseal to the identical table bank.
     {
-        std::vector<uint8_t> blob2 = storage::Seal(prog, pass);
+        std::vector<uint8_t> blob2 = storage::Seal(prog, pass, storage::KdfTier::kNone);
         CHECK(blob2.size() == blob.size());
         CHECK(blob2 != blob);
         vm::Program un2;

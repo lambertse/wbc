@@ -10,9 +10,14 @@
 #  * asserts the `# ct=` lines match. Both builds run the SAME pushed blob, so
 #    they must produce identical ciphertext. If they don't, an obfuscation pass
 #    broke the VM and every timing below is meaningless — so that's a hard error.
-#  * derives `open - kdf`. Raw `open` is ~99% Argon2id (identical, unobfuscated
-#    libsodium in both builds), which flattens its ratio to ~1.0x and hides the
-#    real cost of the flattened + MBA'd loader in trusted_storage.cpp.
+#  * asserts the `# kdf_tier=` lines match. `open` and `kdf` mean different
+#    things at different tiers, so comparing across them is meaningless.
+#  * derives `open - kdf`. At the Argon2id tiers (medium/heavy) raw `open` is
+#    ~99% KDF — identical, unobfuscated libsodium in both builds — which
+#    flattens its ratio to ~1.0x and hides the real cost of the flattened +
+#    MBA'd loader in trusted_storage.cpp. At tier `none` the KDF is HKDF and
+#    costs microseconds, so `open` is the loader and the subtraction finally
+#    resolves.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -30,6 +35,7 @@ meta() {  # meta <file> <key> -> value from the "# key=value" header line
 
 CT_PLAIN=$(meta "$PLAIN" ct);          CT_OMVLL=$(meta "$OMVLL" ct)
 LBL_PLAIN=$(meta "$PLAIN" label);      LBL_OMVLL=$(meta "$OMVLL" label)
+TIER_PLAIN=$(meta "$PLAIN" kdf_tier);  TIER_OMVLL=$(meta "$OMVLL" kdf_tier)
 : "${LBL_PLAIN:=plain}"; : "${LBL_OMVLL:=omvll}"
 
 # Same label on both sides means this is an A/A, not an A/B: the caller handed
@@ -65,6 +71,28 @@ if [ "$CT_PLAIN" != "$CT_OMVLL" ]; then
     exit 1
 fi
 echo "  ciphertext    : $CT_PLAIN  (identical in both builds — VM semantics preserved)"
+
+# The tier sets the scale of both `open` and `kdf`, so a mismatch makes the whole
+# lower half of this report a comparison between different quantities. Both runs
+# are supposed to use the SAME pushed blob, so a mismatch also means the two runs
+# did not — worth failing on rather than footnoting.
+if [ -n "$TIER_PLAIN" ] && [ -n "$TIER_OMVLL" ]; then
+    if [ "$TIER_PLAIN" != "$TIER_OMVLL" ]; then
+        {
+            echo
+            echo "  FAIL: the two runs used blobs sealed at DIFFERENT KDF tiers:"
+            echo "        $LBL_PLAIN = $TIER_PLAIN"
+            echo "        $LBL_OMVLL = $TIER_OMVLL"
+            echo "  'open' and 'kdf' are not comparable across tiers. Both runs must"
+            echo "  use the same blob."
+        } >&2
+        exit 1
+    fi
+    echo "  kdf tier      : $TIER_PLAIN"
+else
+    # Pre-v4 CSVs have no such header. Say so instead of silently assuming.
+    echo "  kdf tier      : (not recorded — CSV predates the tiered KDF)"
+fi
 echo
 
 # --- ratio table ------------------------------------------------------------
@@ -116,33 +144,38 @@ END {
     }
 
     # --- derived: open minus the KDF ---------------------------------------
-    # ILL-CONDITIONED. The loader (a ~0.5 MB AEAD decrypt + a header parse, well
-    # under 1 ms) sits inside a ~200 ms Argon2id whose own run-to-run variation is
-    # larger than the signal. Report a value only when the difference clears 2x the
-    # one-sided sampling spread in BOTH builds; otherwise state the bound. Printing
-    # a ratio of two unresolved differences would be inventing precision, and can
-    # even come out negative.
-    if (("open" in p_min) && ("kdf_argon2id" in p_min) &&
-        ("open" in o_min) && ("kdf_argon2id" in o_min)) {
-        pl = p_min["open"] - p_min["kdf_argon2id"]
-        ol = o_min["open"] - o_min["kdf_argon2id"]
-        pm = 2 * ((p_med["open"] - p_min["open"] > p_med["kdf_argon2id"] - p_min["kdf_argon2id"]) \
-                  ? p_med["open"] - p_min["open"] : p_med["kdf_argon2id"] - p_min["kdf_argon2id"])
-        om = 2 * ((o_med["open"] - o_min["open"] > o_med["kdf_argon2id"] - o_min["kdf_argon2id"]) \
-                  ? o_med["open"] - o_min["open"] : o_med["kdf_argon2id"] - o_min["kdf_argon2id"])
+    # At the Argon2id tiers this is ILL-CONDITIONED: the loader (a ~0.4 MB AEAD
+    # decrypt + a header parse, well under 1 ms) sits inside a ~60-250 ms KDF whose
+    # own run-to-run variation is larger than the signal. Report a value only when
+    # the difference clears 2x the one-sided sampling spread in BOTH builds;
+    # otherwise state the bound. Printing a ratio of two unresolved differences
+    # would be inventing precision, and can even come out negative.
+    #
+    # At tier `none` the KDF is HKDF (microseconds), so the subtraction becomes
+    # well-conditioned and this line reports the loader for real. Same code path —
+    # the guard simply stops firing.
+    if (("open" in p_min) && ("kdf" in p_min) &&
+        ("open" in o_min) && ("kdf" in o_min)) {
+        pl = p_min["open"] - p_min["kdf"]
+        ol = o_min["open"] - o_min["kdf"]
+        pm = 2 * ((p_med["open"] - p_min["open"] > p_med["kdf"] - p_min["kdf"]) \
+                  ? p_med["open"] - p_min["open"] : p_med["kdf"] - p_min["kdf"])
+        om = 2 * ((o_med["open"] - o_min["open"] > o_med["kdf"] - o_min["kdf"]) \
+                  ? o_med["open"] - o_min["open"] : o_med["kdf"] - o_min["kdf"])
         if (pl > pm && ol > om) {
             r = (pl > 0) ? ol / pl : 0
             printf "\n  %-16s %13s %13s %8.2fx   <- trusted_storage.cpp loader\n", \
                    "open - kdf", fmt(pl), fmt(ol), r
-            printf "  %-16s %13s %13s %9s      (flatten+MBA), Argon2id removed\n", "", "", "", ""
+            printf "  %-16s %13s %13s %9s      (flatten+MBA), KDF removed\n", "", "", "", ""
         } else {
             bound = (pm > om) ? pm : om
             printf "\n  %-16s %13s %13s %9s   <- NOT RESOLVABLE: the loader is\n", \
                    "open - kdf", "< " fmt(pm), "< " fmt(om), "n/a"
             printf "  %-16s %13s %13s %9s      under %s in both builds, i.e. lost\n", \
                    "", "", "", "", fmt(bound)
-            printf "  %-16s %13s %13s %9s      inside Argon2id. Heavy passes on\n", "", "", "", ""
+            printf "  %-16s %13s %13s %9s      inside the KDF. Heavy passes on\n", "", "", "", ""
             printf "  %-16s %13s %13s %9s      trusted_storage.cpp are affordable.\n", "", "", "", ""
+            printf "  %-16s %13s %13s %9s      Re-seal at --kdf light to measure it.\n", "", "", "", ""
         }
     }
 }' "$PLAIN" "$OMVLL"
@@ -159,9 +192,12 @@ cat <<'EOF'
                   modest ratio. A 5-20x here means the hot-path exclusions are
                   NOT taking effect — debug the targeting, not the VM.
   data_copy       the DATA image vm::Run copies per block. Not obfuscated by any
-                  pass, so it dilutes vm_run's ratio; it is ~2% of vm_run, which
-                  is why `vm_run - copy` barely moves. Present to prove that,
-                  not because it is interesting on its own.
+                  pass, so it dilutes vm_run's ratio. Its share is strongly
+                  device-dependent — ~4% of vm_run on an aarch64 Linux host but
+                  ~30% on an arm64 phone — so on a phone `vm_run - copy` moves a
+                  LOT, and its ratio is the honest one for the interpreter.
+                  (An older note here claimed ~2% universally; that was a host
+                  measurement. Trust the two columns above, not this text.)
   encrypt_block   the same work through the C ABI. wbcrypto.cpp is sensitive but
                   not hot, so this wrapper IS fully flattened. Expect a worse
                   ratio than vm_run; the gap is the SDK-glue cost.
@@ -169,8 +205,20 @@ cat <<'EOF'
                   session key. Fixed — it does not grow with the payload.
   bulk_seal_4k    the conventional AEAD that moves the payload. NOT white-box
                   protected and not obfuscated, so expect a ratio near 1.00x.
-  open            ~97% Argon2id, so its ratio is near 1.00x by construction and
-                  says nothing about the obfuscated loader. See `open - kdf`,
-                  which usually reports a BOUND rather than a value — the loader
-                  is genuinely too cheap to resolve through the KDF.
+  open            dominated by the blob's KDF tier, so at medium/heavy its ratio
+                  is near 1.00x by construction and says nothing about the
+                  obfuscated loader. See `open - kdf`, which at those tiers
+                  reports a BOUND rather than a value — the loader is genuinely
+                  too cheap to resolve through the KDF. Re-seal the blob with
+                  `--kdf light` and `open` becomes the loader, measurable.
+  kdf             the blob's own key derivation: Argon2id at medium/heavy, HKDF
+                  at light. Vendored libsodium either way, so it is the control
+                  metric — if THIS moved between builds, the machine moved and
+                  every other number moved with it.
+
+  A note on picking the tier, since it is the one dial on `open`: it trades
+  offline passphrase-guessing resistance for startup latency, and nothing else.
+  It does not touch the white-box, the VM or the tables. `light` is correct only
+  for a high-entropy machine-generated passphrase — see wbc_kdf_tier in
+  include/wbcrypto.h.
 EOF

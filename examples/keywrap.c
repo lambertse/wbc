@@ -63,7 +63,12 @@ int main(int argc, char** argv) {
 
     uint8_t* blob = NULL;
     size_t blob_len = 0;
-    s = wbc_seal_key(long_term_key, pass, 42, 1, &blob, &blob_len);
+    /* WBC_KDF_HIGH because `pass` above is a human-shaped string: something an
+     * attacker could guess, so it is worth ~250 ms per guess to stop them. That
+     * cost is paid once per wbc_open, not per wrap. Had the passphrase been 16
+     * bytes of wbc_random output — as an embedded machine secret should be —
+     * WBC_KDF_NONE would be the correct choice and open would cost ~2 ms. */
+    s = wbc_seal_key(long_term_key, pass, 42, 1, WBC_KDF_HIGH, &blob, &blob_len);
     if (s != WBC_OK) { fprintf(stderr, "seal: %s\n", wbc_strerror(s)); return 1; }
 
     wbc_ctx* ctx = NULL;

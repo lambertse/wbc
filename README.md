@@ -44,11 +44,15 @@ for the full component-by-component implementation. All docs:
   tracing — see [Threat model & honest limitations](#threat-model--honest-limitations).)
 * **Phase 2 — trusted storage.** The compiled program is sealed at rest with a
   vetted AEAD: the table bank is encrypted with XChaCha20-Poly1305 under a key
-  derived from the passphrase by Argon2id (memory-hard, random per-blob salt),
-  and the whole program header (VM code, opcode maps, sizes) is authenticated as
-  associated data. A wrong passphrase or any tamper fails authentication, so the
-  blob does not open. Crypto is vendored libsodium (`third_party/fetch_deps.sh`),
-  never home-rolled.
+  derived from the passphrase and a random per-blob salt, and the whole program
+  header (VM code, opcode maps, sizes) is authenticated as associated data. A
+  wrong passphrase or any tamper fails authentication, so the blob does not open.
+  The key derivation's cost is a **per-blob tier** — Argon2id (memory-hard) when
+  a human chose the passphrase, HKDF when it is a high-entropy machine secret.
+  That choice is the only thing standing between a ~2 ms and a ~250 ms
+  `wbc_open`; see [`wbc_kdf_tier`](include/wbcrypto.h) and
+  [ARCHITECTURE §6.1](docs/ARCHITECTURE.md). Crypto is vendored libsodium
+  (`third_party/fetch_deps.sh`), never home-rolled.
 
 ## Techniques from the deck → where they live
 
@@ -134,8 +138,9 @@ A `CMakeLists.txt` is also provided for standard toolchains (mirrors the script;
 
 ## Performance
 
-`bench/wb_bench.cpp` measures the shipped runtime (interpreter, block/ECB/CTR
-encryption, blob open). The interesting question is what the O-MVLL native-code
+`bench/wb_bench.cpp` measures the shipped runtime (interpreter, block encryption,
+key wrap/unwrap, bulk AEAD, blob open and its KDF — the ECB/CTR metrics went with
+the bulk API in 2.0.0). The interesting question is what the O-MVLL native-code
 obfuscation costs, so `scripts/bench_android.sh` builds the benchmark **twice from
 identical sources** — plugin on and off — and runs both on a connected arm64 device,
 interleaved and CPU-pinned, then prints a per-surface ratio table:
@@ -201,10 +206,18 @@ layer-by-layer picture:
   self-destruct — but the program is straight-line, so anyone who *runs/traces*
   it recovers it, and the diffused key is unaffected.
 * **Trusted-storage sealing protects the blob at rest, it is not key secrecy.**
-  The seal uses Argon2id + XChaCha20-Poly1305 (authenticated), which resists
-  offline passphrase guessing and tampering — but an attacker who runs the field
-  binary has the passphrase, so durable protection needs hardware-backed device
-  binding (`src/rt/device_binding.*`, roadmap).
+  The seal uses XChaCha20-Poly1305 (authenticated) under a passphrase-derived
+  key, which resists tampering and — at the Argon2id tiers — offline passphrase
+  guessing. But an attacker who runs the field binary **has** the passphrase, so
+  durable protection needs hardware-backed device binding
+  (`src/rt/device_binding.*`, roadmap).
+
+  That last point is exactly why the KDF cost is a per-blob tier rather than a
+  constant. When the passphrase ships inside the binary that opens the blob —
+  the normal case for a packed shared library — there is nothing to guess, and
+  paying Argon2id's ~250 ms buys no security at all. `WBC_KDF_NONE` is the
+  honest choice there. It is *not* a general-purpose speedup: for a
+  human-chosen passphrase it removes the one property the seal did have.
 
 Deferred / future work: 32-bit mixing bijections, dynamic-analysis hardening
 (anti-debug, data-dependent control flow), space-hard constructions, and

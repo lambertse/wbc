@@ -14,8 +14,13 @@
 # Usage:
 #   ./scripts/gen_blob.sh                                   # demo key -> sealed.blob
 #   ./scripts/gen_blob.sh --key <32hex> --pass P --seed N --out out.blob
+#   ./scripts/gen_blob.sh --kdf light  ... # cheap open; needs a random --pass
 #   HOST_CXX=/path/to/clang++ ./scripts/gen_blob.sh ...     # force a compiler
-# Any args are passed straight through to wb_keygen.
+# Any args are passed straight through to wb_keygen, including
+# --kdf light|medium|heavy (default heavy). The tier decides wbc_open's cost:
+# heavy ~250 ms (Argon2id 64 MiB), medium ~60 ms, light ~2 ms (HKDF) — but light
+# is only sound for a high-entropy machine-generated passphrase. The demo
+# default below uses --pass demo, so it deliberately does NOT use --kdf light.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

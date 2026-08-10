@@ -308,27 +308,28 @@ effective root differs → decode fails from instruction zero. Both are proven i
 **Goal:** the on-disk blob keeps the tables encrypted at rest and is
 tamper-evident, without a separate MAC.
 
-`src/storage/trusted_storage.cpp` — `Seal(program, passphrase)` /
+`src/storage/trusted_storage.cpp` — `Seal(program, passphrase, tier)` /
 `Unseal(blob, passphrase, out)`. Blob format (little-endian):
 
 ```
-magic "WBTS" | version(4) | salt(16) | nonce(24) |
+magic "WBTS" | version(4) | kdf_tier(4) | salt(16) | nonce(24) |
 block_off(4) | code_len(4) | data_len(4) | fw_root(8) |
 phys_to_op(256) | op_to_phys(256) | code[code_len] |
 ciphertext[data_len + 16]
 ```
 
-- **Version** is currently **3**. `Unseal` rejects any other value outright
+- **Version** is currently **4**. `Unseal` rejects any other value outright
   rather than trying to run it. v3 added the `LDBI`/`STBI` opcodes and widened
   the register file, and because `kOpCount` feeds the interpreter fingerprint
-  (§5) it also changes the decode root — so a v2 blob would decode to garbage,
-  and refusing it is the only safe behaviour. **Blobs must be regenerated when
-  this number changes.** Covered by `tests/test_fw.cpp` (`TestVersionGate`).
-- **Storage key** = **Argon2id** over the passphrase and the random per-seal
-  salt, at libsodium's INTERACTIVE cost tier (mobile-appropriate; the SENSITIVE
-  tier would make `wbc_open` unusable on a phone). Each passphrase guess costs
-  one Argon2id evaluation, which is what defuses offline guessing. It accounts
-  for ~97% of `wbc_open`'s wall time.
+  (§5) it also changes the decode root — so a v2 blob would decode to garbage.
+  v4 inserted `kdf_tier`, which shifts every field after it: a v3 blob's salt
+  sits where v4 reads the tier. Refusing is the only safe behaviour in both
+  cases, and there is deliberately no dual-read path. **Blobs must be
+  regenerated when this number changes.** Covered by `tests/test_fw.cpp`
+  (`TestVersionGate`).
+- **Storage key** = a key derivation over the passphrase and the random
+  per-seal salt, whose cost is chosen **per blob** by `kdf_tier` — see
+  §6.1 below. It is the single dominant term in `wbc_open`'s wall time.
 - **Integrity (anti-tamper):** the table image is sealed with
   **XChaCha20-Poly1305**, with *everything before* `ciphertext` — the whole
   header, both opcode maps and the code — passed as associated data. So a wrong
@@ -338,6 +339,64 @@ ciphertext[data_len + 16]
 
 A wrong passphrase (or a tampered blob) does **not** error — it yields a program
 that runs and produces wrong ciphertext, by design (no oracle for the attacker).
+
+### 6.1 The KDF cost tier
+
+`wbc_open` used to cost ~250 ms on a phone, and ~99% of that was one Argon2id
+call at libsodium's INTERACTIVE tier. The cost was payload-independent: a
+library with a 532-byte payload paid the same 250 ms as one with 5 MB.
+
+Since v4 the cost is a per-blob choice (`storage::KdfTier` / `wbc_kdf_tier`),
+recorded in the header so **any runtime opens any blob** and a deployed blob's
+cost is auditable via `wbc_blob_kdf_tier()` without paying to open it.
+
+| Tier | Derivation | `open`, host¹ | `open`, phone² |
+|---|---|---|---|
+| `none` / `--kdf light` | HKDF-SHA256 | **1.03 ms** | ~2 ms |
+| `low` / `--kdf medium` | Argon2id, 16 MiB / 2 passes | **45.3 ms** | ~61 ms |
+| `high` / `--kdf heavy` | Argon2id, 64 MiB / 2 passes | **195.5 ms** | 254 ms |
+
+¹ measured, aarch64 Linux, `wb_bench --open-reps 5`, min-of-5.
+² `high` measured on-device; the others scaled from it by the measured host
+ratio. Re-measure rather than quoting these.
+
+**The tiers differ ONLY in the cost of deriving the seal key.** The white-box,
+the VM, the encodings and the table bank are byte-for-byte identical at every
+tier — `tests/test_sdk.cpp` asserts all three produce the same ciphertext. Do
+not reach for a lower tier expecting to make `vm::Run` faster; it is not on the
+`wbc_open` path at all.
+
+**How to choose.** Argon2id makes each passphrase *guess* expensive. That is
+worth 250 ms only if something is being guessed:
+
+- **`heavy`** — a human chose the passphrase and it does **not** travel with the
+  blob. This is the default in `wb_keygen` deliberately: forgetting the flag
+  must not silently produce a blob with no guessing resistance.
+- **`medium`** — moderate-entropy secret, or you want a cost bump without a
+  64 MiB transient allocation. That allocation is a second, independent problem
+  from latency: at app startup, across several libraries, it is a low-memory-kill
+  risk that no amount of latency tuning addresses.
+- **`light`** — the passphrase is **≥128 bits of machine-generated randomness**.
+  Then nothing is guessed and a memory-hard KDF buys nothing for its cost;
+  HKDF-SHA256 is the *correct* construction, not a weakened one. This is the
+  tier for a packed shared library whose loader carries its own random
+  passphrase: an attacker with the binary has the blob *and* the passphrase
+  deterministically, so Argon2id was never defending anything there.
+  **If a human can type the passphrase, this tier is a full break of the seal's
+  offline-guessing resistance.**
+
+**Downgrade is not an attack.** `kdf_tier` sits inside the AEAD's associated
+data, so rewriting it to `none` changes both the derived key and the
+authenticated data: the tag fails for every passphrase. The attacker gets a
+cheap wrong answer, not a cheap guessing oracle. An out-of-range tier is
+rejected before any derivation, and the value is a closed enum rather than raw
+ops/memory integers so a blob cannot ask the runtime to allocate 4 GiB.
+Both properties are asserted in `tests/test_sdk.cpp`.
+
+One side effect worth knowing: at `light` the `open - kdf` line in `wb_bench`
+becomes well-conditioned, so the obfuscated loader's own cost (~1 ms: header
+parse plus the 400 KB AEAD decrypt) is measurable for the first time. At the
+Argon2id tiers that subtraction is an upper bound, not a measurement.
 
 ---
 
@@ -352,8 +411,9 @@ that runs and produces wrong ciphertext, by design (no oracle for the attacker).
 Surface:
 
 ```
-wbc_seal_key(key, pass, seed, hardened, &blob, &len)   # offline: key → sealed blob
+wbc_seal_key(key, pass, seed, hardened, tier, &blob, &len)  # offline: key → sealed blob
 wbc_open(blob, len, pass, &ctx)                        # runtime: load a blob
+wbc_blob_kdf_tier(blob, len, &tier)                    # which tier? (header read, free)
 wbc_encrypt_block(ctx, in16, out16)                    # one block — KAT/diagnostic only
 wbc_wrap_key(ctx, sk32, wrapped48)                     # white-box wraps a session key
 wbc_unwrap_key(ctx, wrapped48, sk32)                   # ...and recovers it

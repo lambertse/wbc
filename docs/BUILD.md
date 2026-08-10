@@ -1,7 +1,8 @@
 # Build Guide
 
 The White-box Crypto VM is a C++17 project. Its only third-party dependency is
-**libsodium** (the seal's Argon2id KDF + XChaCha20-Poly1305 AEAD), vendored from
+**libsodium** (the seal's KDFs — Argon2id and HKDF-SHA256 — plus its
+XChaCha20-Poly1305 AEAD), vendored from
 source. It builds two ways: a self-contained `build.sh` (the tested path) and a
 portable `CMakeLists.txt` for standard toolchains.
 
@@ -456,7 +457,40 @@ blob, runs them interleaved, and prints a ratio table:
 ```
 
 Useful flags: `--rounds N`, `--cooldown SEC`, `--cpu N`, `--blob FILE`,
-`--pass P`, `--reps N`, `--no-build`, `--serial S`.
+`--pass P`, `--kdf TIER`, `--reps N`, `--no-build`, `--serial S`.
+
+The script regenerates `$BLOB` when it is missing **or** left over from an older
+blob format version — checking only for existence used to mean a stale blob got
+pushed to the device, where it failed as an opaque mid-run error.
+
+**It measures two KDF tiers every run.** `wbc_open`'s cost is set by the blob's
+tier, not by the obfuscator, and the tiers differ by ~100x — so reporting one
+alone invites reading a 250 ms `open` as "the loader is slow". The primary blob
+(`--kdf`, default heavy) gets the full metric set; a contrasting-tier blob
+(`sealed-light.blob` beside it) is re-measured for `open`/`kdf` only via
+`wb_bench --only open,kdf`, since those are the only tier-dependent metrics. The
+extra pass costs seconds at heavy and milliseconds at light. Output ends with:
+
+```
+  === wbc_open across KDF tiers (min over 2 round(s)) ===
+
+  tier              plain          omvll       kdf alone
+  --------  -------------  -------------  --------------
+  heavy         264.70 ms      260.99 ms      265.24 ms*
+  light           2.14 ms        2.20 ms            3 us
+
+  * kdf alone came out >= open: it is timed in a separate loop, so at the
+    Argon2id tiers it is NOT a subset of open and the two are not subtractable.
+
+  => kdf=light opens 124x faster than kdf=heavy (262.6 ms saved per open)
+```
+
+Tiers in that table are always read back out of the blob headers, never echoed
+from the `--kdf` flag — so a reused blob can never be reported as a tier it is
+not. The column is headed `kdf alone` rather than "of which KDF" deliberately: it
+is a separate measurement, not a decomposition of `open`, and at the Argon2id
+tiers it can exceed `open` outright (starred when it does). Same ill-conditioning
+as under *Reading `open - kdf`* below.
 
 For a quick **host** baseline (no obfuscation — the plugin cannot load into a host
 compiler, see Option C):
@@ -465,6 +499,24 @@ compiler, see Option C):
 ./scripts/gen_blob.sh                                   # -> sealed.blob, pass "demo"
 ./build.sh && ./build/wb_bench --blob sealed.blob --pass demo
 ```
+
+`wb_bench` prints the blob's KDF tier, and that tier sets the scale of both
+`open` and `kdf`. To see the difference, seal the same key three ways:
+
+```sh
+for t in light medium heavy; do
+    ./scripts/gen_blob.sh --key 000102030405060708090a0b0c0d0e0f --pass demo \
+        --seed 42 --kdf $t --out b-$t.blob
+    ./build/wb_bench --blob b-$t.blob --pass demo | grep -E 'kdf tier|^  (open|kdf) '
+done
+```
+
+Measured on aarch64 Linux (min-of-5): `open` = 1.03 ms / 45.3 ms / 195.5 ms for
+light / medium / heavy. On an arm64 phone, heavy is ~254 ms. The tier changes
+nothing else — the ciphertext is identical, which `bench_compare.sh` asserts, and
+it refuses to compare two runs whose blobs were sealed at different tiers.
+See [ARCHITECTURE §6.1](ARCHITECTURE.md) for when each tier is sound; `light`
+requires a high-entropy machine-generated passphrase.
 
 `./build.sh test` does **not** run the benchmark: it asserts nothing, so it has no
 business in the test suite. It is likewise not registered with `ctest`.
@@ -479,15 +531,24 @@ business in the test suite. It is likewise not registered with `ctest`.
 | `wrap_key` / `unwrap_key` | `wbc_wrap_key` / `wbc_unwrap_key` — the real data path | as above |
 | `bulk_seal_4k` | `wbc_bulk_seal`, 4 KiB | none — conventional AEAD, not white-boxed |
 | `open` | `wbc_open` | flatten + **MBA** + constants + strings |
-| `kdf_argon2id` | `crypto_pwhash` alone | none — vendored libsodium |
+| `kdf` | the blob's own derivation alone — `crypto_pwhash` at medium/heavy, HKDF-SHA256 at light | none — vendored libsodium |
+
+`--only METRIC,...` restricts the run to named metrics (an unknown name is an
+error, not a silent no-op). `bench_android.sh` uses `--only open,kdf` for its
+second, contrasting-tier pass; it is also handy for iterating on one number
+without paying for the whole set.
 
 The splits exist because two large, **unobfuscated** costs sit inside the numbers
 you actually care about and drag their ratios towards a meaningless 1.00x:
 
 - `vm::Run` copies the whole DATA image (~400 KB) on **every** block
   (`ctx.data = prog.data` in `src/vm/vm.cpp`). Measured separately as `data_copy`
-  so it can be subtracted. In practice it is only ~3% of `vm_run`, so `vm_run`
-  really is the interpreter's own cost — the metric is there to *prove* that.
+  so it can be subtracted. Its share is strongly device-dependent: ~4% of
+  `vm_run` on an aarch64 Linux host, but **~30% on an arm64 phone** (200,518 of
+  669,697 ns) — v3 cut `vm_run` by 34% while the fixed-size copy stayed put, and
+  memcpy is relatively slower there. `wb_bench` prints the live percentage; trust
+  that over any figure quoted here, and do not budget from the host number when
+  targeting a phone.
 
   This copy looks like obvious waste (only the trailing 48 bytes are ever
   written) but **it is load-bearing**: restoring the read-only table bank before
@@ -499,7 +560,9 @@ you actually care about and drag their ratios towards a meaningless 1.00x:
   block's ~3k scattered lookups miss to DRAM) *and* is a weaker guarantee;
   reusing the buffer and still restoring saves only the allocation, which is
   **not measurable**. Leave it alone.
-- `wbc_open` is ~97% Argon2id. Measured separately as `kdf_argon2id`.
+- `wbc_open` is dominated by the blob's KDF tier — ~96-99% of it at
+  `--kdf medium`/`heavy`, and ~0% at `--kdf light`. Measured separately as `kdf`,
+  which times whichever derivation the blob's own header selects.
 
 ### "How long does my 5 MB payload take?"
 
@@ -523,16 +586,30 @@ memory for its lifetime — see the README's Performance section and
 
 ### Reading `open - kdf`
 
-This subtraction is **ill-conditioned** and the tooling will usually refuse to give
-you a number. The obfuscated loader in `trusted_storage.cpp` does a ~0.5 MB AEAD
-decrypt plus a header parse — well under a millisecond — inside a ~200 ms KDF whose
-own run-to-run variation is larger than that. So `wb_bench` reports a **bound**
-("NOT RESOLVABLE (< X ms)") unless the difference clears 2x the sampling spread.
+**At `--kdf medium`/`heavy` this subtraction is ill-conditioned** and the tooling
+will usually refuse to give you a number. The obfuscated loader in
+`trusted_storage.cpp` does a ~0.4 MB AEAD decrypt plus a header parse — around a
+millisecond — inside a 60-250 ms KDF whose own run-to-run variation is larger than
+that. So `wb_bench` reports a **bound** ("NOT RESOLVABLE (< X ms)") unless the
+difference clears 2x the sampling spread.
 
 That bound is the useful answer: the flattened + MBA'd loader costs less than a few
-ms of a ~200 ms `wbc_open`, i.e. **heavy passes on the cold gate code are
+ms of the whole `wbc_open`, i.e. **heavy passes on the cold gate code are
 affordable** — exactly the bet `omvll_config.py` makes. More reps tighten the bound
 only slowly; a quiet, CPU-pinned device helps more.
+
+Beware the case where it *does* clear the margin at an Argon2id tier: that is
+still not the loader. `open` and `kdf` each allocate and fault in a 16/64 MiB
+Argon2 arena in a different context, and the difference carries that allocation
+artifact. Measured here it overstated the loader several-fold — 8.96 ms at
+`heavy` against a ground truth of 1.03 ms. `wb_bench` labels such a value
+UPPER BOUND for that reason.
+
+**Re-seal the same blob at `--kdf light` to measure the loader for real.** The
+HKDF path costs microseconds, so the subtraction becomes well-conditioned and
+`open` *is* the loader. Measured on aarch64 Linux, `open` = **1.03 ms** at
+`light` against **195.5 ms** at `heavy` — the first honest figure this repo has
+had for the loader's own cost.
 
 ### Measurement hygiene (already handled by the script)
 
@@ -612,6 +689,6 @@ Expected output — seven passing suites:
 [PASS] test_vm          VM output == interpreter == AES (plain + hardened)
 [PASS] test_obf         MBA / opaque / opcode-blinding primitives
 [PASS] test_fw          context-keyed firmware: decode == AES, tamper cascade
-[PASS] test_sdk         C-ABI SDK: seal/open/ECB/CTR, error paths
+[PASS] test_sdk         C-ABI SDK: seal/open, key wrap, KDF tiers, error paths
 [PASS] test_e2e         seal→unseal→run, key-absence, anti-tamper
 ```

@@ -25,11 +25,25 @@ struct wbc_ctx {
     vm::Program prog;
 };
 
+/* wbc_kdf_tier and storage::KdfTier are cast into each other in both directions
+ * (wbc_blob_kdf_tier here, wbc_seal_key in wbcrypto_provision.cpp). They are
+ * separate types because one is the C ABI and the other is internal; pin the
+ * values so a future edit to either enum is a build error rather than a blob
+ * silently sealed at the wrong cost. */
+static_assert(static_cast<uint32_t>(storage::KdfTier::kNone) == WBC_KDF_NONE, "tier enum drift");
+static_assert(static_cast<uint32_t>(storage::KdfTier::kLow) == WBC_KDF_LOW, "tier enum drift");
+static_assert(static_cast<uint32_t>(storage::KdfTier::kHigh) == WBC_KDF_HIGH, "tier enum drift");
+
 extern "C" {
 
-/* 2.0.0: the bulk entry points (wbc_encrypt_ecb, wbc_crypt_ctr) were removed in
+/* 3.0.0: the seal KDF cost became a per-blob tier recorded in the header (blob
+ * format v3 -> v4, no dual-read: v3 blobs must be re-provisioned) and
+ * wbc_seal_key gained a `tier` parameter. The RUNTIME ABI is unchanged --
+ * wbc_open and friends keep their signatures; the break is in the provisioning
+ * surface, which never ships in this library.
+ * 2.0.0: the bulk entry points (wbc_encrypt_ecb, wbc_crypt_ctr) were removed in
  * favour of wbc_wrap_key/wbc_unwrap_key. Breaking ABI change, hence the major. */
-const char* wbc_version(void) { return "2.0.0"; }
+const char* wbc_version(void) { return "3.0.0"; }
 
 const char* wbc_strerror(wbc_status s) {
     switch (s) {
@@ -51,9 +65,12 @@ wbc_status wbc_open(const uint8_t* blob, size_t blob_len, const char* passphrase
     if (!blob || !out_ctx) return WBC_ERR_ARG;
     try {
         auto* ctx = new wbc_ctx();
-        std::vector<uint8_t> b(blob, blob + blob_len);
         std::string pass = passphrase ? passphrase : "";
-        if (!storage::Unseal(b, pass, ctx->prog)) {
+        /* Unseal reads the caller's buffer directly. It used to be handed a
+         * std::vector copy of the whole blob (~455 KB) purely to match a vector
+         * parameter — invisible next to a 250 ms Argon2id, but a measurable
+         * fraction of a WBC_KDF_NONE open. */
+        if (!storage::Unseal(blob, blob_len, pass, ctx->prog)) {
             delete ctx;
             return WBC_ERR_FORMAT;
         }
@@ -64,6 +81,15 @@ wbc_status wbc_open(const uint8_t* blob, size_t blob_len, const char* passphrase
     } catch (...) {
         return WBC_ERR_FORMAT;
     }
+}
+
+wbc_status wbc_blob_kdf_tier(const uint8_t* blob, size_t blob_len,
+                             wbc_kdf_tier* out_tier) {
+    if (!blob || !out_tier) return WBC_ERR_ARG;
+    storage::KdfTier tier;
+    if (!storage::PeekTier(blob, blob_len, tier)) return WBC_ERR_FORMAT;
+    *out_tier = static_cast<wbc_kdf_tier>(tier);
+    return WBC_OK;
 }
 
 wbc_status wbc_encrypt_block(wbc_ctx* ctx, const uint8_t in[WBC_BLOCK_BYTES],

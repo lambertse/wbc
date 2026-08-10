@@ -44,6 +44,42 @@ extern "C" {
 /* A wrapped session key on the wire: 16-byte IV || 32-byte wrapped key. */
 #define WBC_WRAPPED_KEY_BYTES 48
 
+/* ---- Seal KDF cost tier --------------------------------------------------
+ *
+ * Which key derivation the seal uses. Chosen when the blob is sealed and
+ * recorded IN THE BLOB, so any runtime opens any blob and a deployed blob's
+ * cost is auditable after the fact (see wbc_blob_kdf_tier).
+ *
+ * This is the ONLY dial on wbc_open's latency: ~99% of a WBC_KDF_HIGH open is
+ * the Argon2id call. The tiers do NOT differ in white-box strength — the VM,
+ * the encodings and the table bank are identical at every tier.
+ *
+ * Argon2id exists to make each passphrase GUESS expensive. Pick the tier by
+ * asking whether an attacker has to guess:
+ *
+ *   WBC_KDF_HIGH   a human chose the passphrase and it does NOT ship with the
+ *                  blob. Guessing is the attack; pay to stop it.
+ *   WBC_KDF_LOW    moderate-entropy secret, or you want a cost bump without a
+ *                  64 MiB transient allocation at startup.
+ *   WBC_KDF_NONE   the passphrase is a high-entropy machine secret. Nothing is
+ *                  guessed, so a memory-hard KDF buys nothing for its cost.
+ *
+ * WBC_KDF_NONE IS SOUND ONLY IF the passphrase carries >= 128 bits of
+ * uniformly random machine-generated entropy. If a human can type it, or it is
+ * derived from anything guessable, this tier is a FULL BREAK of the seal's
+ * offline-guessing resistance. It is the correct construction for a random
+ * secret, not a weakened one — but the entropy precondition is yours to meet.
+ *
+ * Downgrade is not an attack: the tier is inside the AEAD's associated data,
+ * so rewriting it changes both the derived key and the authenticated data, and
+ * the tag then fails for every passphrase. */
+typedef enum wbc_kdf_tier {
+    WBC_KDF_NONE = 0,  /* HKDF-SHA256; microseconds                    */
+    WBC_KDF_LOW  = 1,  /* Argon2id, 16 MiB / 2 passes                  */
+    WBC_KDF_HIGH = 2   /* Argon2id, 64 MiB / 2 passes (libsodium
+                        * INTERACTIVE) — the pre-3.0.0 behaviour       */
+} wbc_kdf_tier;
+
 typedef enum wbc_status {
     WBC_OK         =  0,
     WBC_ERR_ARG    = -1,  /* NULL/invalid argument or bad length          */
@@ -66,21 +102,37 @@ WBC_API const char* wbc_strerror(wbc_status s);
 /* Seal a 16-byte AES-128 key. `passphrase` may be NULL (treated as empty).
  * `seed` diversifies the encodings/obfuscation (pass 0 for a default).
  * `hardened` != 0 applies full bytecode obfuscation; 0 emits bare bytecode.
+ * `tier` selects the KDF cost paid by every later wbc_open of this blob --
+ * read the wbc_kdf_tier contract above before choosing anything but
+ * WBC_KDF_HIGH. Returns WBC_ERR_ARG for an out-of-range tier.
  * On success, *out_blob points to a malloc'd buffer (free it with wbc_free)
  * and *out_len holds its length. */
 WBC_API wbc_status wbc_seal_key(const uint8_t key[WBC_KEY_BYTES],
                                 const char* passphrase,
                                 uint64_t seed,
                                 int hardened,
+                                wbc_kdf_tier tier,
                                 uint8_t** out_blob,
                                 size_t* out_len);
 
 /* ---- Runtime: open a blob and encrypt ------------------------------------ */
 /* Open a sealed blob (as produced by wbc_seal_key or the wb_keygen CLI).
  * The blob is authenticated (AEAD): a wrong passphrase or a tampered blob
- * returns WBC_ERR_FORMAT rather than opening. Free with wbc_close. */
+ * returns WBC_ERR_FORMAT rather than opening. Free with wbc_close.
+ *
+ * Cost is dominated by the blob's own KDF tier, not by its size: a
+ * WBC_KDF_HIGH blob takes ~250 ms on a phone whether its payload is 500 bytes
+ * or 5 MB. Use wbc_blob_kdf_tier to find out which you have. */
 WBC_API wbc_status wbc_open(const uint8_t* blob, size_t blob_len,
                             const char* passphrase, wbc_ctx** out_ctx);
+
+/* Report the KDF tier a blob was sealed at, without opening it -- a header
+ * read, so it costs nothing and needs no passphrase. Use it to audit what a
+ * deployed blob actually paid for, or to enforce a minimum tier before
+ * spending the open. Returns WBC_ERR_FORMAT if the blob is truncated, not a
+ * WBTS blob, the wrong format version, or carries an unknown tier. */
+WBC_API wbc_status wbc_blob_kdf_tier(const uint8_t* blob, size_t blob_len,
+                                     wbc_kdf_tier* out_tier);
 
 /* Encrypt exactly one 16-byte block.
  *

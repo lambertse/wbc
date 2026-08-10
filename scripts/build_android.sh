@@ -257,11 +257,17 @@ cat <<EOF
 
 ==> done. Next steps:
 
-  # provision a blob on the HOST (never on device — see docs/BUILD.md)
-  ./scripts/gen_blob.sh
+  # provision a blob on the HOST (never on device — see docs/BUILD.md).
+  # --kdf picks what every wbc_open of that blob will cost; it is recorded in the
+  # blob, NOT in this build, so the .so you just built opens any tier.
+  ./scripts/gen_blob.sh                          # --kdf heavy (default), open ~250 ms
+  ./scripts/gen_blob.sh --kdf light --pass "\$(openssl rand -hex 16)"
+                                                 # open ~2 ms; needs a RANDOM pass
+                                                 # (see wbc_kdf_tier in wbcrypto.h)
 
   # push the .so into your app, or run the on-device A/B:
-  ./scripts/bench_android.sh
+  ./scripts/bench_android.sh                     # prints the blob's KDF tier up front
+  ./scripts/bench_android.sh --kdf light --no-build
 
 Host build is a separate tree and a separate command:
   ./build.sh                 # Mach-O/native -> build/
