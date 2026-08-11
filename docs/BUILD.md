@@ -2,14 +2,67 @@
 
 The White-box Crypto VM is a C++17 project. Its only third-party dependency is
 **libsodium** (the seal's KDFs — Argon2id and HKDF-SHA256 — plus its
-XChaCha20-Poly1305 AEAD), vendored from
-source. It builds two ways: a self-contained `build.sh` (the tested path) and a
-portable `CMakeLists.txt` for standard toolchains.
+XChaCha20-Poly1305 AEAD), vendored from source.
+
+**There are two jobs here, on two different machines, and every script is named for
+the one it does.** Getting this straight up front saves most of the confusion:
+
+| Script | Machine | Produces | You need it to... |
+|---|---|---|---|
+| `scripts/build_android.sh` | NDK cross-compile | `build-android/libwbcrypto.a` | ship the runtime — **this is the only artifact that ships** |
+| `scripts/gen_blob.sh` | your host | `build-host/wb_keygen`, `wb_encrypt`, a `.blob` | seal a key offline; this is what the consumer's packer calls |
+| `scripts/build_host.sh` | your host | `build/test_*`, `wb_keygen`, `wb_encrypt` | run the correctness suite |
+| `scripts/bench_android.sh` | NDK + a device | two `wb_bench` builds + a ratio table | measure what O-MVLL costs |
+
+Note what is *absent*: no host build produces a shipping library. `libwbcrypto.a`
+exists to be linked into an Android `.so`, so it comes from the NDK path and nowhere
+else — there is no host copy to mix up with the real one, and no `.so` at all (see
+below).
+
+## Runtime vs provisioning (what ships)
+
+The source set is split in two, and **only the runtime half ever reaches a device**:
+
+| Half | Contents | In `libwbcrypto.a`? |
+|---|---|---|
+| runtime | open a sealed blob, `wbc_encrypt_block`, `wbc_wrap_key`/`wbc_unwrap_key`, `wbc_wipe`, + libsodium | **yes** |
+| provisioning | reference AES, `GenerateWhiteBox`, the assembler, `wbc_seal_key` | **no** — host only |
+
+`CMakeLists.txt` enforces the split structurally: `wbcrypto_static` is built from
+`wbvm_runtime_obj` only, so `wbc_seal_key` *cannot* be linked into it by accident,
+and `scripts/build_android.sh` asserts it afterwards with `llvm-nm` (it `die()`s if
+`wbc_seal_key` is defined, or if `wbc_blob_kdf_tier` is missing). That matters
+because the provisioning half contains the white-box *generator* — the code that
+turns a raw AES key into a table network — which must never ship inside an app.
+
+**There is no shared library.** A `libwbcrypto.so` used to be built alongside the
+archive, with its own version script, strip step and macOS/ELF link-flag
+divergence. It was a second way to ship the same code that nobody linked: the
+consumer links the archive into its own `.so`. Symbol hiding moved with it — an
+archive has no dynamic symbol table, so `wbc_*` stays visible there *by design*
+(that is how the consumer resolves it), and the hiding happens one link later, in
+the consumer's `.so`, via `-Wl,--exclude-libs,ALL` or a version script. **Verify it
+there, on the `.so` you actually ship**; nothing in this repo can tell you whether
+that step worked.
+
+The archive is the artifact that used to leak: the strip steps only ever touched the
+`.so`, so `libwbcrypto.a` kept the DWARF the NDK's `-g` produced — 46% of its size,
+and with it the build machine's username and full source layout in
+`.debug_str`/`.debug_line`. Two flags close it, both directory-scope in
+`CMakeLists.txt` so they reach the libsodium objects as well as ours: `-g0` in
+Release (the fix), and `-ffile-prefix-map=<src>=.` for the configs that legitimately
+keep DWARF — which also covers `.rodata`, since a `Debug` build has no `NDEBUG` and
+libsodium's `assert()`s then bake `__FILE__` in. An archive-level `llvm-strip
+--strip-debug` backs this up on the NDK path (`--strip-debug`, never `--strip-all`:
+an archive's symbol table is what the consumer links against).
+`scripts/build_android.sh` asserts the result and fails the build if a host path
+survives, so this cannot regress silently. Verify by hand with
+`strings -a build-android/libwbcrypto.a | grep -E '/Users/|/home/'`.
 
 ## Requirements
 
 - A **C++17 compiler** (`clang++` 8+, `g++` 9+, or `zig c++`).
-- **libsodium source**, vendored with a pinned version + SHA256. Both `build.sh`
+- **libsodium source**, vendored with a pinned version + SHA256. Both `scripts/build_host.sh`
   and CMake fetch it automatically at build/configure time; to do it by hand:
 
   ```sh
@@ -20,101 +73,122 @@ portable `CMakeLists.txt` for standard toolchains.
   portable C is selected automatically), so no system crypto library is
   required. `fetch_deps.sh` is idempotent — it skips deps already vendored.
 
-## Runtime vs provisioning (what ships)
+## The host correctness build — `scripts/build_host.sh`
 
-The build produces two library flavours; **only the runtime ships to devices**:
+Needs no CMake. It discovers a compiler automatically, in this order:
 
-| Library | Contents | Ships? |
-|---|---|---|
-| `libwbcrypto.{a,so}` | runtime only: open a sealed blob + encrypt (`wbc_open`, `wbc_encrypt_*`) + libsodium | **yes** |
-| `libwbprovision.a` | adds the keygen surface: reference AES, `GenerateWhiteBox`, assembler, `wbc_seal_key` | **no** (build host only) |
-
-The shared library is built with `-fvisibility=hidden` + a linker version script
-(`src/sdk/wbcrypto.map`) so it exports **only** `wbc_*`, and it is stripped
-(`-Wl,--strip-all`, no build-id) so it ships no symbol table or DWARF. On the NDK
-path an extra `llvm-strip --remove-section=.comment` post-link step reaches the
-shipped `.so` (the NDK toolchain otherwise injects `-g`). Verify with
-`readelf --dyn-syms` (only `wbc_*`) and `nm` (no `GenerateWhiteBox`/`AesEncrypt*`).
-
-The static archive ships too, and for a while it did *not* get this treatment: the
-strip steps above only ever touched the `.so`, so `libwbcrypto.a` kept the DWARF
-the NDK's `-g` produced — 46% of its size, and with it the build machine's
-username and full source layout in `.debug_str`/`.debug_line`. Two flags close it,
-both directory-scope in `CMakeLists.txt` so they reach the libsodium objects as
-well as ours: `-g0` in Release (the fix), and `-ffile-prefix-map=<src>=.` for the
-configs that legitimately keep DWARF — which also covers `.rodata`, since a
-`Debug` build has no `NDEBUG` and libsodium's `assert()`s then bake `__FILE__` in.
-An archive-level `llvm-strip --strip-debug` backs this up on the NDK path
-(`--strip-debug`, never `--strip-all`: an archive's symbol table is what the
-consumer links against). `scripts/build_android.sh` asserts the result and fails
-the build if a host path survives, so this cannot regress silently. Verify by hand
-with `strings -a build-android/libwbcrypto.a | grep -E '/Users/|/home/'`.
-
-## Option A — `build.sh` (recommended, no CMake needed)
-
-The script discovers a compiler automatically, in this order:
-
-1. `$CXX` if set
-2. system `c++` / `g++` / `clang++`
-3. a Zig toolchain: `$ZIG_CXX`, `zig` on `PATH`, or `./toolchain/zig-*/zig`
+1. `$ZIG_BIN` (a `zig` binary; drives `zig c++` and `zig ar` together)
+2. `$CXX` if set
+3. system `c++` / `g++` / `clang++`
+4. a Zig toolchain: `zig` on `PATH`, or `./toolchain/zig-*/zig`
 
 ```sh
-./build.sh            # build the library, the two CLI tools, and all tests
-./build.sh test       # build, then run every test suite
+./scripts/build_host.sh            # build the two CLI tools and all tests
+./scripts/build_host.sh test       # build, then run every test suite
 ```
 
 Force a specific compiler:
 
 ```sh
-CXX=/path/to/clang++ ./build.sh test
-CXX=/path/to/zig-cxx ./build.sh test    # a wrapper that runs `zig c++ "$@"`
+CXX=/path/to/clang++ ./scripts/build_host.sh test
+ZIG_BIN=/path/to/zig ./scripts/build_host.sh test    # brings zig ar/cc along too
 ```
 
 Outputs land in `./build/`:
 
 | Output               | Purpose                                             |
 |----------------------|-----------------------------------------------------|
+| `test_*`             | one executable per test suite — the reason this script exists |
 | `wb_keygen`          | seal an AES key into a blob                          |
 | `wb_encrypt`         | encrypt a block through a sealed blob               |
-| `libwbcrypto.a` / `.so` | the shipped C-ABI runtime SDK (see [../include/wbcrypto.h](../include/wbcrypto.h)) |
-| `libwbprovision.a`   | host-only provisioning lib (adds the keygen surface; not shipped) |
 | `libsodium.a`        | vendored crypto dependency (built once)             |
-| `keywrap`            | C integration demo: the key-wrapping pattern, end to end (→ links `libwbprovision.a`) |
-| `wb_bench` / `wb_ladder` | benchmarks (see [Benchmarks](#benchmarks--what-does-o-mvll-actually-cost)) |
-| `test_*`             | one executable per test suite                        |
+
+**No library, no benchmark.** `libwbcrypto.a` comes from
+`scripts/build_android.sh`; `wb_bench` is only meaningful under the NDK (see
+[Benchmarks](#benchmarks--what-does-o-mvll-actually-cost)). Each binary here links
+the full source set directly, so there is no intermediate archive to keep in sync.
+
+> **`build/` is not toolchain-stamped.** `libsodium.a` is cached and reused when
+> present, so switching compilers (say, adding `ZIG_BIN` to a tree previously built
+> with system `clang++`) reuses an incompatible archive and fails at link with
+> `undefined symbol: sodium_init` and friends — a confusing error with an easy fix:
+> `rm -rf build`. `gen_blob.sh` keys its own cache to compiler+platform to avoid
+> exactly this; this script does not.
 
 Source layout: `src/wbaes/` (white-box compiler), `src/vm/` (the VM),
 `src/fw/` (the context-keyed firmware toolchain), `src/obf/` (obfuscation
 primitives), `src/storage/` (trusted storage), `src/sdk/` (C ABI).
 
-## Option B — CMake (standard toolchains)
+## CMake directly (what the Android script wraps)
+
+`CMakeLists.txt` is the single source of truth for the build graph, and
+`scripts/build_android.sh` is a thin wrapper that hands it the NDK toolchain file.
+You can also drive it on the host — useful mainly to check that a change configures
+and to build `wbcrypto_static` for a link test:
 
 ```sh
-cmake -S . -B build
-cmake --build build -j
-ctest --test-dir build --output-on-failure
+cmake -S . -B build-cmake
+cmake --build build-cmake -j
+ctest --test-dir build-cmake --output-on-failure
 ```
 
-This mirrors `build.sh`; the CLI tools appear as `build/wb_keygen` and
-`build/wb_encrypt`.
+Targets: `wbcrypto_static` (→ `libwbcrypto.a`, the shipped artifact), `wbvm` (the
+full source set, for the tools and tests), `wb_keygen`, `wb_encrypt`, `wb_bench`,
+and one executable per `tests/test_*.cpp`.
 
-## Option C — with native-code obfuscation (O-MVLL)
+> Prefer `scripts/build_host.sh` for the test suite: it needs no CMake, and this
+> container has no system compiler, so a bare `cmake -S . -B ...` will fail
+> compiler detection unless you point `CMAKE_C_COMPILER`/`CMAKE_CXX_COMPILER` at a
+> `zig cc`/`zig c++` wrapper.
+
+## With native-code obfuscation (O-MVLL)
 
 You can additionally obfuscate the *native machine code* of the SDK/VM by loading
 an LLVM pass-plugin such as **[O-MVLL](https://obfuscator.re/omvll)** at compile
-time. This is complementary to the project's own bytecode/data obfuscation — see
-**[ANTI-TAMPER.md](ANTI-TAMPER.md)** for the rationale and what to target. This
-section covers just the build steps.
+time. This is complementary to the project's own bytecode/data obfuscation.
 
 > **The tested path is an Android NDK cross-compile, driven by CMake + Ninja, on
 > a macOS (Apple Silicon) host.** O-MVLL only supports **AArch64 / AArch32**, so
 > the obfuscated artifacts target `arm64-v8a`; they build and link on the host
-> but do not *run* there (see [Verify](#verify-the-obfuscated-build)). `build.sh`
-> is a host build and is **not** the O-MVLL path — its role here is only the
-> host-side correctness gate. The steps below are distilled from a real,
-> reproduced setup; confirm the current version matrix on the
+> but do not *run* there (see [Verify](#verify-the-obfuscated-build)).
+> `scripts/build_host.sh` is a host build and is **not** the O-MVLL path — its
+> role here is only the host-side correctness gate. The steps below are distilled
+> from a real, reproduced setup; confirm the current version matrix on the
 > [releases page](https://github.com/open-obfuscator/o-mvll/releases), as O-MVLL
 > pins each plugin to a specific NDK.
+
+### What gets obfuscated, and the naming trap
+
+`third_party/omvll/omvll_config.py` targets the sensitive **functions** (never whole
+modules — that overwhelms the backend; see the file's header) in the hot TUs:
+`vm.cpp`, `handlers.cpp`, `assembler.cpp`, `trusted_storage.cpp`, `fwcrypt.cpp`,
+and the SDK glue. Enabled passes:
+
+- control-flow flattening + bogus control flow (everywhere sensitive),
+- opaque/encrypted **constants** and **string encoding** on the sensitive TUs —
+  this is what removes the `WBTS` magic and the SplitMix64/FNV constants from a
+  `strings`/constant scan,
+- MBA arithmetic (heaviest — bring up last; dial back if the register coalescer
+  crashes),
+- anti-hooking on the runtime/SDK TUs.
+
+> **The config matches module names by SUBSTRING**
+> (`any(s in n for s in _SENSITIVE_MODULES)`), so the *filenames above are
+> load-bearing*. A file whose path merely CONTAINS one of them gets obfuscated
+> too — which matters most for `bench/`: a benchmark named so that its path
+> contains `vm.cpp` or `handlers.cpp` would be obfuscated along with the code it
+> is trying to measure, silently corrupting its own numbers and invalidating the
+> A/B below. Do not rename a `bench/` file into that shape, and do not add a
+> `_SENSITIVE_MODULES` entry short enough to collide with one.
+
+Benchmark `wbc_encrypt_block` after enabling CFF/MBA and pick a level you can
+afford — see [Benchmarks](#benchmarks--what-does-o-mvll-actually-cost) below.
+Note `wbc_open`'s cost is dominated by the blob's KDF tier (~96-99% of it at
+`--kdf medium`/`heavy`), so the obfuscated loader there is reported as a bound
+rather than a value; the practical upshot is that heavy passes on the cold gate
+code are affordable. Re-seal at `--kdf light` and the loader becomes directly
+measurable (~1 ms), which is the honest way to check that claim rather than
+inferring it from a bound. See [ARCHITECTURE §6.1](ARCHITECTURE.md).
 
 ### The known-good configuration
 
@@ -220,8 +294,8 @@ the environment first (the failure modes here are opaque; a missing
 `OMVLL_PYTHONPATH` aborts thirty seconds into a compile with *"failed to get the
 Python codec of the filesystem encoding"*), defaults `OMVLL_CONFIG` /
 `OMVLL_PYTHONPATH` to their in-repo paths, and then **verifies the artifact**: that
-`libwbcrypto.so` really is ELF for the requested ABI, and that its dynamic symbol
-table exports only `wbc_*`.
+`libwbcrypto.a` embeds no host paths, carries no DWARF in Release, defines
+`wbc_blob_kdf_tier`, and does **not** define `wbc_seal_key`.
 
 ```sh
 ./scripts/build_android.sh                   # obfuscated release, -> build-android/
@@ -231,12 +305,12 @@ table exports only `wbc_*`.
 
 It is a *wrapper*, not a second build system: CMake stays the single source of
 truth. Note the default output directory is **`build-android/`**, not `build/` —
-`build.sh` caches `libsodium.a` and skips rebuilding when the file is present, so
-sharing one directory between the host and cross builds means the next `./build.sh`
+`scripts/build_host.sh` caches `libsodium.a` and skips rebuilding when the file is present, so
+sharing one directory between the host and cross builds means the next `./scripts/build_host.sh`
 silently links an ELF archive and fails with `undefined symbol: sodium_memzero`.
 Keep the two trees separate and neither needs an `rm -rf`.
 
-**Do not use `build.sh` for the ELF build.** It selects its `.so` link flags from
+**Do not use `scripts/build_host.sh` for the ELF build.** It selects its `.so` link flags from
 `uname -s` — the *host* OS — so cross-compiling from macOS takes the Mach-O branch,
 feeds `-dead_strip`/`-exported_symbol` to an ELF linker, hits its
 "linker rejected the symbol-hygiene flags" fallback, and relinks **without the
@@ -266,8 +340,8 @@ Configure prints `native-code obfuscation: -fpass-plugin=…` when the plugin is
 set. If the build crashes while *loading* the plugin, see
 [Troubleshooting O-MVLL](#troubleshooting-o-mvll).
 
-> **Targeting matters — see [ANTI-TAMPER.md](ANTI-TAMPER.md) and the template
-> `third_party/omvll/omvll_config.py`.** The config targets individual *functions* and
+> **Targeting matters — see [What gets obfuscated](#what-gets-obfuscated-and-the-naming-trap)
+> above and the template `third_party/omvll/omvll_config.py`.** The config targets individual *functions* and
 > excludes STL/libc++/EH-runtime symbols. An empty or module-wide config silently
 > obfuscates *everything* (including inlined STL), which overwhelms the backend —
 > see the two crash entries in troubleshooting.
@@ -279,19 +353,18 @@ set. If the build crashes while *loading* the plugin, see
 > surface). If the NDK build hits a backend crash, exclude `third_party/libsodium`
 > from the plugin first (compile it in a separate target without `-fpass-plugin`).
 
-### Single-command obfuscated build via `build.sh` (host plugin)
+### Can `scripts/build_host.sh` do this in one command? Effectively, no.
 
-`build.sh` can produce an obfuscated build in one command — it exposes
-pass-through `EXTRA_CXXFLAGS` / `EXTRA_CFLAGS` / `EXTRA_LDFLAGS` — but only for a
-**host** build, and only with a plugin that fits that model. The r29 plugin this
-repo ships does **not** qualify, for two reasons:
+It exposes pass-through `EXTRA_CXXFLAGS` / `EXTRA_LDFLAGS`, so it *can* load a
+plugin — but only for a **host** build, and only with a plugin that fits that
+model. The r29 plugin this repo ships does **not** qualify, for two reasons:
 
 - **ABI:** `-fpass-plugin` needs the plugin's LLVM to exactly match the compiler
   loading it. `omvll_ndk_r29.dylib` is built against **NDK r29's** clang;
-  `build.sh`'s compiler (AppleClang, zig, or system) is a different LLVM build, so
+  `scripts/build_host.sh`'s compiler (AppleClang, zig, or system) is a different LLVM build, so
   it crashes at plugin load (the exit-139 ABI-mismatch case).
 - **Target:** the r29 plugin is for the Android `arm64-v8a` cross-compile, whereas
-  `build.sh` builds *host* binaries and then runs them (`./build.sh test`). NDK
+  `scripts/build_host.sh` builds *host* binaries and then runs them (`./scripts/build_host.sh test`). NDK
   clang would emit Android ELF binaries that can't execute on the host.
 
 So the one-command path requires an O-MVLL plugin built for a **host-targeting
@@ -303,33 +376,34 @@ export OMVLL_CONFIG="$PWD/third_party/omvll/omvll_config.py"
 export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"   # plugin's embedded CPython
 CXX=/path/to/matching/clang++  CC=/path/to/matching/clang  ZIG_BIN= \
 EXTRA_CXXFLAGS="-fpass-plugin=/path/to/host-OMVLL.dylib" \
-EXTRA_CFLAGS="-fpass-plugin=/path/to/host-OMVLL.dylib" \
-  ./build.sh test
+  ./scripts/build_host.sh test
 ```
 
-or
-```sh
+The equivalent for the real (Android) build, spelled out — this is exactly what
+`scripts/build_android.sh` runs for you, so prefer the script:
 
-export PYTHONHOME="$(pyenv root)/versions/3.10.7"
-export NDK=/Users/tri.le/Library/Android/sdk/ndk/29.0.14206865
+```sh
+export NDK="$HOME/Library/Android/sdk/ndk/29.0.14206865"   # your NDK root
+export PYTHONHOME="$(pyenv root)/versions/3.10.7"          # only if CPython is under pyenv
 export OMVLL_CONFIG="$PWD/third_party/omvll/omvll_config.py"
 export OMVLL_PYTHONPATH="$PWD/third_party/python/Lib"
 
-rm -rf build
-cmake -GNinja -B build \
-  -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+rm -rf build-android
+cmake -GNinja -B build-android \
+  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
   -DCMAKE_BUILD_TYPE=Release \
-  -DOMVLL_PLUGIN=$PWD/third_party/omvll/omvll_ndk_r29.dylib
-cmake --build build -j
-```
+  -DOMVLL_PLUGIN="$PWD/third_party/omvll/omvll_ndk_r29.dylib"
+cmake --build build-android -j
 ```
 
-```
+> Use `build-android/`, not `build/`: the latter is `scripts/build_host.sh`'s tree,
+> and its cached `libsodium.a` would then be an Android archive that the next host
+> build happily reuses and fails to link.
 
 Set `ZIG_BIN=` empty (as above) so the zig toolchain doesn't shadow your `CXX`.
 When any `EXTRA_*` var is set, the build prints
-`obfuscation flags: cxx='…' c='…' ld='…'` so you can confirm they applied. Two
+`obfuscation flags: cxx='…' ld='…'` so you can confirm they applied. Two
 caveats:
 
 - **Don't add `-Wl,-z,muldefs` on macOS** — that's a GNU-ld/lld flag and Apple's
@@ -344,7 +418,7 @@ that is the tested configuration.
 ### Verify the obfuscated build
 
 Obfuscation is semantics-preserving, so the correctness gate is the **host** test
-suite — run it via `build.sh` on the host (or a host CMake build), where all 7
+suite — run it via `scripts/build_host.sh` on the host (or a host CMake build), where all 7
 suites must still pass; a failure means a pass broke something (narrow the
 targeting in `third_party/omvll/omvll_config.py`).
 
@@ -352,7 +426,7 @@ The Android `arm64-v8a` artifacts from the CMake/NDK path above were confirmed t
 **compile and link cleanly**, but they do not execute on the macOS host.
 **Functional verification of the obfuscated Android build requires an AArch64
 device or emulator.** A quick static sanity
-check that obfuscation did something: the obfuscated `libwbcrypto.so` should show
+check that obfuscation did something: the obfuscated `libwbcrypto.a` should show
 a larger `.text` and flattened control flow in a disassembler.
 
 ### Debugging aids
@@ -429,8 +503,8 @@ that already has one. Two causes, check in order:
 2. **Anti-hook vs control-flow flattening** — even applied once, CFF clones
    functions (the `foo (.3)` / `foo.25` suffixes) and anti-hook then chokes on the
    clone. Fix: leave `anti_hooking` **off** in `omvll_config.py` (the template
-   ships it off); runtime anti-hook / anti-DBI is provided by `src/rt/anti_tamper.*`
-   instead. (Both reproduced on NDK r29 / O-MVLL v1.9.1.)
+   ships it off). Note this leaves runtime anti-hook / anti-DBI **unaddressed** —
+   there is no replacement in this SDK. (Both reproduced on NDK r29 / O-MVLL v1.9.1.)
 
 **Segfault (exit 139) inside `omvll.dylib` at
 `llvm::PassBuilder::registerModuleAnalyses` / `RunOptimizationPipeline`, for every
@@ -442,9 +516,9 @@ the project builds and passes all host tests without it.
 
 ## Benchmarks — what does O-MVLL actually cost?
 
-[ANTI-TAMPER.md](ANTI-TAMPER.md) tells you to "benchmark `wbc_encrypt_block` after
-enabling CFF/MBA and pick a level you can afford", and lists throughput as an
-acceptance criterion. `bench/wb_bench.cpp` plus `scripts/bench_android.sh` are how
+[the O-MVLL section](#with-native-code-obfuscation-o-mvll) tells you to benchmark
+`wbc_encrypt_block` after enabling CFF/MBA and pick a level you can
+afford. `bench/wb_bench.cpp` plus `scripts/bench_android.sh` are how
 you do that.
 
 One command builds `wb_bench` **twice from identical sources** — plugin on, plugin
@@ -452,7 +526,7 @@ off — pushes both to a connected arm64 device along with **one** host-generate
 blob, runs them interleaved, and prints a ratio table:
 
 ```sh
-# in the same shell you use for a normal obfuscated build (Option C env)
+# in the same shell you use for a normal obfuscated build (the O-MVLL env below)
 ./scripts/bench_android.sh
 ```
 
@@ -493,11 +567,11 @@ tiers it can exceed `open` outright (starred when it does). Same ill-conditionin
 as under *Reading `open - kdf`* below.
 
 For a quick **host** baseline (no obfuscation — the plugin cannot load into a host
-compiler, see Option C):
+compiler, see the O-MVLL section):
 
 ```sh
 ./scripts/gen_blob.sh                                   # -> sealed.blob, pass "demo"
-./build.sh && ./build/wb_bench --blob sealed.blob --pass demo
+./scripts/build_host.sh && ./build/wb_bench --blob sealed.blob --pass demo
 ```
 
 `wb_bench` prints the blob's KDF tier, and that tier sets the scale of both
@@ -518,7 +592,7 @@ it refuses to compare two runs whose blobs were sealed at different tiers.
 See [ARCHITECTURE §6.1](ARCHITECTURE.md) for when each tier is sound; `light`
 requires a high-entropy machine-generated passphrase.
 
-`./build.sh test` does **not** run the benchmark: it asserts nothing, so it has no
+`./scripts/build_host.sh test` does **not** run the benchmark: it asserts nothing, so it has no
 business in the test suite. It is likewise not registered with `ctest`.
 
 ### What it measures, and why it is split up
@@ -529,7 +603,6 @@ business in the test suite. It is likewise not registered with `ctest`.
 | `data_copy` | the per-block DATA image copy | none — plain allocation + memmove |
 | `encrypt_block` | `wbc_encrypt_block` (KAT primitive) | flatten + constants + struct-access + strings |
 | `wrap_key` / `unwrap_key` | `wbc_wrap_key` / `wbc_unwrap_key` — the real data path | as above |
-| `bulk_seal_4k` | `wbc_bulk_seal`, 4 KiB | none — conventional AEAD, not white-boxed |
 | `open` | `wbc_open` | flatten + **MBA** + constants + strings |
 | `kdf` | the blob's own derivation alone — `crypto_pwhash` at medium/heavy, HKDF-SHA256 at light | none — vendored libsodium |
 
@@ -566,23 +639,31 @@ you actually care about and drag their ratios towards a meaningless 1.00x:
 
 ### "How long does my 5 MB payload take?"
 
-Run `./build/keywrap 5`. There is no `--bulk-mb` any more, because as of 2.0.0 there
-is no way to push a payload through the white-box: `wbc_encrypt_ecb` and
-`wbc_crypt_ctr` are gone, replaced by `wbc_wrap_key` / `wbc_unwrap_key` over exactly
-one session key.
+There is no `--bulk-mb`, and no benchmark here can answer this on its own, because
+the SDK does not move payloads. Since 2.0.0 there is no way to push data through
+the white-box (`wbc_encrypt_ecb` and `wbc_crypt_ctr` are gone, replaced by
+`wbc_wrap_key` / `wbc_unwrap_key` over exactly one session key), and the AEAD
+helpers that used to move the payload were removed too — the caller supplies its
+own cipher.
 
-The cost model is therefore two terms, and only one of them scales:
+The cost model is two terms, and **only the term we do not own scales**:
 
-- **fixed:** `wrap_key` — two white-box blocks, ~0.5 ms, *regardless of payload size*;
-- **scaling:** `bulk_seal_4k` — conventional XChaCha20-Poly1305, ~GB/s.
+- **fixed, ours:** `wrap_key` — two white-box blocks, ~0.5 ms, *regardless of
+  payload size*. `wb_bench` prints this as `per payload`.
+- **scaling, yours:** your cipher over the payload. A ChaCha20 or
+  XChaCha20-Poly1305 pass runs at roughly GB/s, so ~1-2 ms per MiB; measure it in
+  your own benchmark, not here.
 
-Measured end to end: a 5 MiB round trip is **~13 ms per leg**, against ~85 s if the
-payload itself went through the VM. `wb_bench`'s derived section prints the two terms
-as `per payload` so the split is visible rather than asserted.
+For reference, native-lib-encryption's `rt_roundtrip` reports ~13.7 ms total for a
+5.5 MB `.text` on an aarch64 host: 1.1 ms `wbc_open`, 0.83 ms `wbc_unwrap_key`, and
+11.8 ms of its own ChaCha20. Against ~85 s if the payload itself went through the
+VM. That is the shape to expect — the white-box terms are flat and small, and the
+only line that grows with the data is the caller's.
 
-Note the AEAD half is **not** white-box protected, and the session key is plaintext in
-memory for its lifetime — see the README's Performance section and
-[ANTI-TAMPER.md](ANTI-TAMPER.md) §4 for what that does and does not cost you.
+Note the payload leg is **not** white-box protected, and the session key is
+plaintext in memory for its lifetime — see the README's Performance section and the
+memory-exposure caveat in `include/wbcrypto.h` for what that does and does not cost
+you.
 
 ### Reading `open - kdf`
 
@@ -653,10 +734,10 @@ Zig toolchain provides a full clang-based `zig c++`:
 #    (e.g. zig-<arch>-linux-<ver>.tar.xz) and extract it into ./toolchain/
 mkdir -p toolchain && tar -xf zig-*.tar.xz -C toolchain
 
-# 2. build.sh auto-detects ./toolchain/zig-*/zig, or make a wrapper:
+# 2. scripts/build_host.sh auto-detects ./toolchain/zig-*/zig, or make a wrapper:
 printf '#!/bin/sh\nexec "%s/zig" c++ "$@"\n' "$PWD/toolchain/zig-<...>" > zig-cxx
 chmod +x zig-cxx
-CXX=$PWD/zig-cxx ./build.sh test
+CXX=$PWD/zig-cxx ./scripts/build_host.sh test
 ```
 
 > Note: `.tar.xz` needs `xz` to extract. If `xz` is unavailable, decompress with
@@ -668,9 +749,9 @@ warnings) and then caches it; subsequent builds are fast and quiet.
 
 ## Compiler flags
 
-`build.sh` compiles with `-std=c++17 -O2 -Isrc -Iinclude -Itests
--Wall -Wextra` (plus anything in `EXTRA_CXXFLAGS`/`EXTRA_CFLAGS`, see
-[Option C](#option-c--with-native-code-obfuscation-o-mvll)). The full build is a
+`scripts/build_host.sh` compiles with `-std=c++17 -O2 -Isrc -Iinclude -Itests
+-Wall -Wextra` (plus anything in `EXTRA_CXXFLAGS`, see
+[the O-MVLL section](#with-native-code-obfuscation-o-mvll)). The full build is a
 few seconds; there is no incremental object cache — every test binary is linked
 against the library sources directly, which keeps the build script trivial and
 dependency-free.
@@ -678,7 +759,7 @@ dependency-free.
 ## Running the tests
 
 ```sh
-./build.sh test
+./scripts/build_host.sh test
 ```
 
 Expected output — seven passing suites:

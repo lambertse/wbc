@@ -1,10 +1,17 @@
 // wb_keygen — compile an AES-128 key into a sealed trusted-storage blob.
 //
-//   wb_keygen --key <32 hex> [--pass <phrase>] [--seed N] [--plain]
+//   wb_keygen --key <32 hex> [--pass <phrase>] [--seed N]
 //             [--kdf light|medium|heavy] --out FILE
 //
 // The key is consumed here and never written out: the blob contains only the
 // white-box table network (key diffused) inside the obfuscated VM.
+//
+// The bytecode is ALWAYS hardened. There is deliberately no flag for the bare
+// variant: this tool's output is a shipping artifact, and a switch that quietly
+// removes the bytecode obfuscation is only ever a way to ship one by accident.
+// vm::ObfOptions::None() still exists for the differential tests, which compare
+// hardened against bare in-process (tests/test_vm.cpp), and for wbc_seal_key's
+// `hardened` parameter — neither writes a blob you could ship unnoticed.
 //
 // --kdf picks what every later wbc_open of this blob pays. It defaults to
 // `heavy` deliberately: forgetting the flag must not silently produce a blob
@@ -50,14 +57,12 @@ static bool ParseTier(const std::string& s, storage::KdfTier& out) {
 int main(int argc, char** argv) {
     std::string key_hex, pass, out_path, kdf_name = "heavy";
     uint64_t seed = 0xA5F00D;
-    bool plain = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(); };
         if (a == "--key") key_hex = next();
         else if (a == "--pass") pass = next();
         else if (a == "--seed") seed = std::strtoull(next().c_str(), nullptr, 0);
-        else if (a == "--plain") plain = true;
         else if (a == "--kdf") kdf_name = next();
         else if (a == "--out") out_path = next();
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
@@ -72,7 +77,7 @@ int main(int argc, char** argv) {
     if (!ParseHex16(key_hex, key) || out_path.empty()) {
         std::fprintf(stderr,
                      "usage: wb_keygen --key <32 hex> [--pass P] [--seed N] "
-                     "[--plain] [--kdf light|medium|heavy] --out FILE\n");
+                     "[--kdf light|medium|heavy] --out FILE\n");
         return 2;
     }
 
@@ -80,8 +85,7 @@ int main(int argc, char** argv) {
 
     // Sealed VM blob (for the SDK / CLI runtime path).
     if (!out_path.empty()) {
-        vm::ObfOptions obf = plain ? vm::ObfOptions::None() : vm::ObfOptions::All();
-        vm::Program prog = vm::AssembleWhiteBox(*wb, seed ^ 0x9999, obf);
+        vm::Program prog = vm::AssembleWhiteBox(*wb, seed ^ 0x9999, vm::ObfOptions::All());
         std::vector<uint8_t> blob = storage::Seal(prog, pass, tier);
         std::ofstream f(out_path, std::ios::binary);
         if (!f) { std::fprintf(stderr, "cannot write %s\n", out_path.c_str()); return 1; }
@@ -90,9 +94,11 @@ int main(int argc, char** argv) {
         /* Report the tier: it is invisible in the output bytes but decides every
          * later wbc_open's cost AND the blob's guessing resistance, so it should
          * not be something you have to remember you chose. */
-        std::printf("sealed white-box -> %s (%zu bytes, %s bytecode, %zu B code, "
+        /* "hardened bytecode" is a fixed string, not a variable: it is part of the
+         * PASS signal native-lib-encryption greps for in its Phase-1 check. */
+        std::printf("sealed white-box -> %s (%zu bytes, hardened bytecode, %zu B code, "
                     "kdf=%s)\n",
-                    out_path.c_str(), blob.size(), plain ? "plain" : "hardened",
+                    out_path.c_str(), blob.size(),
                     prog.code.size(), kdf_name.c_str());
         if (tier == storage::KdfTier::kNone)
             std::fprintf(stderr,

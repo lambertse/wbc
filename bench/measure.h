@@ -1,6 +1,6 @@
 // measure.h — the shared timing harness for the benchmarks in this directory.
 //
-// Extracted from wb_bench.cpp so wb_ladder.cpp can reuse it verbatim rather than
+// Kept separate from wb_bench.cpp so a second benchmark can reuse it rather than
 // growing a second, subtly-different copy: the calibration rule, the min/median
 // choice and the anti-elision `sink` are all load-bearing for whether the
 // numbers mean anything, and two copies would drift.

@@ -1,7 +1,7 @@
 # Architecture & Implementation
 
 A complete tour of how the White-box Crypto VM is built, component by component.
-Read [OVERVIEW.md](OVERVIEW.md) first for the concepts and the honest security
+Read the [README](../README.md) first for the concepts and the honest security
 framing. This document assumes you're comfortable reading C++ and want to know
 *exactly* how each piece works and where it lives.
 
@@ -418,21 +418,23 @@ wbc_encrypt_block(ctx, in16, out16)                    # one block — KAT/diagn
 wbc_wrap_key(ctx, sk32, wrapped48)                     # white-box wraps a session key
 wbc_unwrap_key(ctx, wrapped48, sk32)                   # ...and recovers it
 wbc_random / wbc_wipe                                  # session-key hygiene
-wbc_bulk_seal(sk32, in, len, out, &out_len)            # conventional AEAD over the payload
-wbc_bulk_open(sk32, in, len, out, &out_len)
 wbc_close / wbc_free
 ```
 
 `wbc_ctx` simply owns a `vm::Program`; `wbc_encrypt_block` calls `vm::Run`.
 
-**There is deliberately no bulk-through-the-VM entry point.** `wbc_encrypt_ecb` and
+**There is deliberately no bulk entry point of any kind.** `wbc_encrypt_ecb` and
 `wbc_crypt_ctr` existed until 2.0.0 and were removed: the white-box runs at ~0.06
-MB/s, so any API shaped like "encrypt this buffer" is a trap. The only stream-cipher
-use left is CTR over exactly one session key, inside `wbc_wrap_key`, where the length
-is a compile-time constant rather than a caller argument — so the slow shape is not
-expressible. The white-box protects the KEY; the AEAD moves the DATA.
+MB/s, so any API shaped like "encrypt this buffer" is a trap. The `wbc_bulk_seal` /
+`wbc_bulk_open` AEAD helpers that replaced them are gone too — they were a thin
+wrapper over libsodium that made the SDK look like it owned a data path it did not.
+The only stream-cipher use left is CTR over exactly one session key, inside
+`wbc_wrap_key`, where the length is a compile-time constant rather than a caller
+argument — so the slow shape is not expressible. **The white-box protects the KEY;
+the caller moves the DATA** with a cipher of its own.
 
-Ships as `libwbcrypto.a` and `libwbcrypto.so`.
+Ships as `libwbcrypto.a` — and only that. There is no shared library; the consumer
+links the archive into its own `.so`. See [BUILD.md](BUILD.md).
 
 ---
 

@@ -2,19 +2,17 @@
 # build_android.sh — one command for the Android/ELF (arm64) build.
 #
 # This is a THIN WRAPPER around the CMake + NDK cross-compile, not a second build
-# system. CMakeLists.txt stays the single source of truth: it is the tested,
-# shipped path, and it is the only one that gets the ELF symbol hygiene right
-# (--version-script + --gc-sections + --strip-all, plus the llvm-strip post-step).
+# system. CMakeLists.txt stays the single source of truth.
 #
-# Do NOT use ./build.sh for this. That script picks its .so link flags from
-# `uname -s`, i.e. the HOST os — so cross-compiling ELF from macOS takes the
-# Darwin branch, feeds Mach-O flags to an ELF linker, silently falls back to
-# linking WITHOUT the hygiene flags, and produces a .so that exports vm::*,
-# wbaes::* and storage::* instead of just wbc_*. See the check at the end of this
-# script, which exists to catch exactly that class of mistake.
+# THIS SCRIPT IS THE ONLY WAY THE SHIPPED ARTIFACT IS BUILT. libwbcrypto.a exists
+# for one purpose — to be linked into an Android .so — so it is produced here and
+# nowhere else. scripts/build_host.sh is the host-side sibling and deliberately
+# builds no library at all: only the tests and the two provisioning tools. If you
+# find yourself wanting a host libwbcrypto.a, what you almost certainly want is
+# scripts/gen_blob.sh (to seal a blob) or scripts/build_host.sh (to run the tests).
 #
 # Usage:
-#   ./scripts/build_android.sh                    # obfuscated release .so + tools
+#   ./scripts/build_android.sh                    # obfuscated release .a + tools
 #   ./scripts/build_android.sh --no-omvll         # same, obfuscation OFF
 #   ./scripts/build_android.sh --target wb_bench  # one target only
 #   ./scripts/build_android.sh --abi armeabi-v7a --api 21
@@ -22,8 +20,8 @@
 #
 # Options:
 #   --out DIR       build directory (default build-android; deliberately NOT
-#                   `build`, so a host ./build.sh tree is never clobbered — see
-#                   the note on the libsodium cache below)
+#                   `build`, which scripts/build_host.sh uses, so the two trees
+#                   never clobber each other — see the libsodium cache note below)
 #   --abi ABI       ANDROID_ABI (default arm64-v8a)
 #   --api N         ANDROID_PLATFORM level (default 24)
 #   --type T        CMAKE_BUILD_TYPE (default Release)
@@ -66,7 +64,7 @@ while [ "$#" -gt 0 ]; do
         --no-omvll)  USE_OMVLL=0; shift ;;
         --clean)     DO_CLEAN=1; shift ;;
         --jobs)      JOBS="$2"; shift 2 ;;
-        -h|--help)   sed -n '2,47p' "$0"; exit 0 ;;
+        -h|--help)   sed -n '2,43p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -117,21 +115,25 @@ if [ "$USE_OMVLL" -eq 1 ]; then
     [ -n "${PYTHONHOME:-}" ] || warn "PYTHONHOME is unset. If your CPython is under pyenv the
       plugin will abort; export PYTHONHOME=\"\$(pyenv root)/versions/3.10.7\""
     if [ "$(uname -s)" = "Darwin" ] && [ -z "${DYLD_LIBRARY_PATH:-}" ]; then
-        warn "DYLD_LIBRARY_PATH is unset — the plugin may fail to load (see docs/BUILD.md Option C)"
+        warn "DYLD_LIBRARY_PATH is unset — the plugin may fail to load (see docs/BUILD.md (O-MVLL section))"
     fi
 else
     say "O-MVLL: DISABLED by --no-omvll"
 fi
 
-# Guard against the mistake this script exists to prevent: a host build tree and
-# a cross build tree in the same directory. build.sh caches libsodium.a and skips
+# Guard against the mistake this script exists to prevent: a host build tree and a
+# cross build tree in the same directory. build_host.sh caches libsodium.a and skips
 # rebuilding when the file is present, so a shared directory means the NEXT host
 # build silently links an ELF archive (or vice versa) and fails with a wall of
 # undefined symbols.
 if [ "$OUT" = "build" ]; then
-    warn "--out build collides with ./build.sh's default output directory.
-      build.sh caches libsodium.a and will reuse this ELF one for a HOST build,
+    warn "--out build collides with scripts/build_host.sh's default output directory.
+      build_host.sh caches libsodium.a and will reuse this ELF one for a HOST build,
       failing with 'undefined symbol: sodium_memzero'. Prefer build-android."
+fi
+if [ "$OUT" = "build-host" ]; then
+    warn "--out build-host collides with scripts/gen_blob.sh's output directory, whose
+      libsodium.a cache is keyed to the HOST compiler. Prefer build-android."
 fi
 
 [ "$DO_CLEAN" -eq 1 ] && { say "cleaning $OUT"; rm -rf "$OUT"; }
@@ -160,63 +162,25 @@ fi
 cmake "${BUILD_ARGS[@]}"
 
 # ---- verify the artifact ----------------------------------------------------
-# The point of this script is a correct ELF with the symbol table locked down, so
-# assert both rather than trusting that the flags took effect. A .so that links
-# but exports its internals is the specific regression the CMake path guards
-# against and build.sh silently does not.
-SO="$OUT/libwbcrypto.so"
-NM=""; READELF=""; STRINGS=""
+NM=""; STRINGS=""
 for d in "$NDK"/toolchains/llvm/prebuilt/*/bin; do
-    [ -x "$d/llvm-readelf" ] && READELF="$d/llvm-readelf"
     [ -x "$d/llvm-nm" ] && NM="$d/llvm-nm"
     [ -x "$d/llvm-strings" ] && STRINGS="$d/llvm-strings"
 done
 
-if [ -f "$SO" ]; then
-    say "artifact: $SO ($(wc -c < "$SO" | tr -d ' ') bytes)"
-
-    if [ -n "$READELF" ]; then
-        # Format: must be ELF, and the right machine for the requested ABI.
-        hdr=$("$READELF" -h "$SO" 2>/dev/null || true)
-        case "$hdr" in
-            *ELF*) ;;
-            *) die "$SO is not an ELF object — the toolchain file did not take effect" ;;
-        esac
-        mach=$(printf '%s\n' "$hdr" | sed -n 's/^ *Machine: *//p')
-        say "format: ELF, machine=${mach:-unknown}"
-
-        # Symbol hygiene: the dynamic symbol table must EXPORT only wbc_*.
-        #
-        # Two filters matter here and both were found by testing rather than
-        # reasoning. Columns are: Num Value Size Type Bind(5) Vis Ndx(7) Name(8).
-        #   * Ndx == UND means the symbol is IMPORTED, not exported — every real
-        #     .so imports __cxa_finalize, memcpy and friends. Counting those as
-        #     leaks makes the check fire on every correct build, which trains you
-        #     to ignore it.
-        #   * WEAK is as exported as GLOBAL, so check both binds.
-        leaked=$("$READELF" --dyn-syms "$SO" 2>/dev/null \
-                 | awk '$8 != "" && ($5 == "GLOBAL" || $5 == "WEAK") && $7 != "UND" {print $8}' \
-                 | grep -v '^wbc_' | grep -v '^$' | sort -u || true)
-        if [ -n "$leaked" ]; then
-            warn "libwbcrypto.so exports symbols other than wbc_*:"
-            printf '%s\n' "$leaked" | sed 's/^/        /' >&2
-            warn "the --version-script did not apply; do not ship this .so"
-        else
-            say "symbol hygiene: OK (exports only wbc_*)"
-        fi
-    else
-        warn "llvm-readelf not found under \$NDK — skipping the format/symbol checks"
-    fi
-else
-    say "no $SO (expected if --target selected something else)"
-fi
-
-# The static archive ships too (docs/BUILD.md), and it is the artifact that used
-# to leak: 402 host paths, all in .debug_str/.debug_line, because nothing stripped
-# it and the NDK toolchain puts -g on every compile line. -g0 + the POST_BUILD
-# strip in CMakeLists.txt close that; this asserts they took effect, in the same
-# spirit as the symbol check above. A leaked username and source layout is a
-# ship-blocker, so this die()s rather than warn()s.
+# There is no .so to check any more — libwbcrypto.a is the one shipped artifact.
+# Symbol hygiene moved WITH it: an archive has no dynamic symbol table to lock
+# down, so `wbc_*` stays visible in it by design (that is how the consumer resolves
+# it) and the hiding happens one link later, when the consumer links this archive
+# into its own .so under -Wl,--exclude-libs,ALL or a version script. Verify it
+# THERE, on the .so you actually ship; nothing this script can inspect will tell
+# you whether that step worked.
+#
+# The archive is also the artifact that used to leak: 402 host paths, all in
+# .debug_str/.debug_line, because nothing stripped it and the NDK toolchain puts -g
+# on every compile line. -g0 + the POST_BUILD strip in CMakeLists.txt close that;
+# the check below asserts they took effect. A leaked username and source layout is
+# a ship-blocker, so it die()s rather than warn()s.
 A="$OUT/libwbcrypto.a"
 if [ -f "$A" ]; then
     say "artifact: $A ($(wc -c < "$A" | tr -d ' ') bytes)"
@@ -249,6 +213,28 @@ if [ -f "$A" ]; then
     else
         warn "llvm-strings not found under \$NDK — skipping the archive path/DWARF checks"
     fi
+
+    # THE shipped-surface invariant: the runtime archive must define the runtime
+    # ABI and must NOT define the provisioning surface. wbc_seal_key appearing here
+    # means the CMake source split broke and every app linking this archive would
+    # carry the white-box GENERATOR — the code that turns a raw AES key into a
+    # table network. That is a ship-blocker, hence die().
+    #
+    # wbc_blob_kdf_tier is checked as the positive half: it is the 3.0.0-only
+    # symbol the consumer's build greps for, so its absence means a stale archive.
+    if [ -n "$NM" ]; then
+        defined=$("$NM" --defined-only "$A" 2>/dev/null | awk '{print $NF}' | sort -u || true)
+        case "$defined" in
+            *wbc_seal_key*)
+                die "$A defines wbc_seal_key — the runtime/provisioning split broke; do not ship this .a" ;;
+        esac
+        case "$defined" in
+            *wbc_blob_kdf_tier*) say "shipped surface: OK (kdf_tier present, seal_key absent)" ;;
+            *) die "$A does not define wbc_blob_kdf_tier — stale or wrong archive" ;;
+        esac
+    else
+        warn "llvm-nm not found under \$NDK — skipping the shipped-surface check"
+    fi
 else
     say "no $A (expected if --target selected something else)"
 fi
@@ -265,10 +251,12 @@ cat <<EOF
                                                  # open ~2 ms; needs a RANDOM pass
                                                  # (see wbc_kdf_tier in wbcrypto.h)
 
-  # push the .so into your app, or run the on-device A/B:
+  # link $OUT/libwbcrypto.a into your own .so (hide the wbc_* names there with
+  # -Wl,--exclude-libs,ALL or a version script), or run the on-device A/B:
   ./scripts/bench_android.sh                     # prints the blob's KDF tier up front
   ./scripts/bench_android.sh --kdf light --no-build
 
-Host build is a separate tree and a separate command:
-  ./build.sh                 # Mach-O/native -> build/
+The host side is separate trees and separate commands:
+  ./scripts/build_host.sh test   # the 7 correctness tests -> build/
+  ./scripts/gen_blob.sh          # wb_keygen + wb_encrypt  -> build-host/
 EOF

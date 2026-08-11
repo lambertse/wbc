@@ -42,7 +42,17 @@ extern "C" {
  * wbc_open and friends keep their signatures; the break is in the provisioning
  * surface, which never ships in this library.
  * 2.0.0: the bulk entry points (wbc_encrypt_ecb, wbc_crypt_ctr) were removed in
- * favour of wbc_wrap_key/wbc_unwrap_key. Breaking ABI change, hence the major. */
+ * favour of wbc_wrap_key/wbc_unwrap_key. Breaking ABI change, hence the major.
+ *
+ * NOT REFLECTED IN THE STRING: wbc_bulk_seal/wbc_bulk_open and WBC_BULK_OVERHEAD
+ * were later removed too, when the SDK was narrowed to its one consumer
+ * (native-lib-encryption, which moves its payload with its own ChaCha20). By the
+ * policy above that is a major bump, and it was deliberately NOT taken: the
+ * consumer detects capability by grepping the header for wbc_blob_kdf_tier and by
+ * the sealed blob's own version field, never by this string, and there is an
+ * unread `valid_wbc()` check on that side that may pin "3.0.0". Bump this only
+ * after reading it. Until then, two archives can report 3.0.0 and differ by these
+ * two symbols -- tell them apart with the linker, not with wbc_version(). */
 const char* wbc_version(void) { return "3.0.0"; }
 
 const char* wbc_strerror(wbc_status s) {
@@ -121,15 +131,10 @@ wbc_status wbc_encrypt_block(wbc_ctx* ctx, const uint8_t in[WBC_BLOCK_BYTES],
  * instead of a buffer overflow. */
 static_assert(WBC_SESSION_KEY_BYTES == crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
               "WBC_SESSION_KEY_BYTES must track libsodium's KEYBYTES");
-static_assert(WBC_BULK_OVERHEAD == crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
-                                       crypto_aead_xchacha20poly1305_ietf_ABYTES,
-              "WBC_BULK_OVERHEAD must track libsodium's NPUBBYTES + ABYTES");
 static_assert(WBC_WRAPPED_KEY_BYTES == WBC_BLOCK_BYTES + WBC_SESSION_KEY_BYTES,
               "WBC_WRAPPED_KEY_BYTES is the IV plus the wrapped key");
 
 namespace {
-constexpr size_t kNonce = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;  // 24
-
 /* sodium_init() is idempotent; <0 means the RNG is unusable. */
 bool EnsureSodium() { return sodium_init() >= 0; }
 
@@ -180,12 +185,12 @@ wbc_status wbc_unwrap_key(wbc_ctx* ctx, const uint8_t wrapped[WBC_WRAPPED_KEY_BY
     }
 }
 
-/* ---- Bulk data helpers ---------------------------------------------------
+/* ---- Utilities -----------------------------------------------------------
  *
- * These are conventional XChaCha20-Poly1305, NOT white-box protected. They are
- * the data mover of the key-wrapping pattern above: the white-box wraps a
- * session key, these move the payload. See the contract and the memory-exposure
- * caveat in wbcrypto.h.
+ * The SDK ships no bulk cipher: the caller moves the payload with a conventional
+ * cipher under the session key (see the contract in wbcrypto.h). These two are
+ * what that pattern still needs from us -- a CSPRNG to mint the session key and
+ * a wipe that the optimizer cannot elide.
  */
 wbc_status wbc_random(uint8_t* buf, size_t len) {
     if (!buf && len) return WBC_ERR_ARG;
@@ -196,42 +201,6 @@ wbc_status wbc_random(uint8_t* buf, size_t len) {
 
 void wbc_wipe(void* p, size_t len) {
     if (p && len) sodium_memzero(p, len);
-}
-
-wbc_status wbc_bulk_seal(const uint8_t key[WBC_SESSION_KEY_BYTES], const uint8_t* in,
-                         size_t len, uint8_t* out, size_t* out_len) {
-    if (!key || !out || !out_len || (!in && len)) return WBC_ERR_ARG;
-    if (len > SIZE_MAX - WBC_BULK_OVERHEAD) return WBC_ERR_ARG;
-    if (!EnsureSodium()) return WBC_ERR_NOMEM;
-
-    /* Random nonce, prepended, so callers never have to manage one. At 24 bytes
-     * random selection is safe for any realistic number of messages. */
-    randombytes_buf(out, kNonce);
-    unsigned long long ct_len = 0;
-    if (crypto_aead_xchacha20poly1305_ietf_encrypt(out + kNonce, &ct_len, in, len,
-                                                   nullptr, 0, nullptr, out,
-                                                   key) != 0)
-        return WBC_ERR_NOMEM;
-    *out_len = kNonce + static_cast<size_t>(ct_len);
-    return WBC_OK;
-}
-
-wbc_status wbc_bulk_open(const uint8_t key[WBC_SESSION_KEY_BYTES], const uint8_t* in,
-                         size_t len, uint8_t* out, size_t* out_len) {
-    if (!key || !in || !out_len) return WBC_ERR_ARG;
-    if (len < WBC_BULK_OVERHEAD) return WBC_ERR_ARG;
-    if (!out && len > WBC_BULK_OVERHEAD) return WBC_ERR_ARG;
-    if (!EnsureSodium()) return WBC_ERR_NOMEM;
-
-    unsigned long long pt_len = 0;
-    /* Verifies the tag before releasing any plaintext, so a forgery writes
-     * nothing to `out`. */
-    if (crypto_aead_xchacha20poly1305_ietf_decrypt(out, &pt_len, nullptr,
-                                                   in + kNonce, len - kNonce,
-                                                   nullptr, 0, in, key) != 0)
-        return WBC_ERR_AUTH;
-    *out_len = static_cast<size_t>(pt_len);
-    return WBC_OK;
 }
 
 void wbc_close(wbc_ctx* ctx) { delete ctx; }

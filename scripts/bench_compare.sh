@@ -203,8 +203,6 @@ cat <<'EOF'
                   ratio than vm_run; the gap is the SDK-glue cost.
   wrap_key        the whole white-box cost of a real use: two blocks to wrap a
                   session key. Fixed — it does not grow with the payload.
-  bulk_seal_4k    the conventional AEAD that moves the payload. NOT white-box
-                  protected and not obfuscated, so expect a ratio near 1.00x.
   open            dominated by the blob's KDF tier, so at medium/heavy its ratio
                   is near 1.00x by construction and says nothing about the
                   obfuscated loader. See `open - kdf`, which at those tiers

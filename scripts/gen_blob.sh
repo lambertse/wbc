@@ -2,7 +2,7 @@
 # gen_blob.sh — build a NATIVE (host) wb_keygen and seal a key into a .blob, in
 # one command, fully isolated from the shipped Android/O-MVLL build.
 #
-# Why this exists: the obfuscated cross-compiled build (CMake+NDK, or build.sh
+# Why this exists: the obfuscated cross-compiled build (CMake+NDK, or scripts/build_host.sh
 # with EXTRA_CXXFLAGS) produces an aarch64 wb_keygen that CANNOT run on your
 # host, and blob provisioning must never be obfuscated. This script therefore:
 #   * uses its own build dir (build-host/), so ./build (the Android artifacts) is
@@ -126,10 +126,13 @@ if [ ! -f "$SODIUM_A" ] || [ "$(cat "$STAMP" 2>/dev/null || true)" != "$WANT" ];
     printf '%s' "$WANT" > "$STAMP"
 fi
 
-# --- host wb_keygen + wb_encrypt (full lib source set, minus tool/rt mains) ---
+# --- host wb_keygen + wb_encrypt (full lib source set, minus the tool mains) ---
+# native-lib-encryption compiles our sources with the same glob to build its
+# rt_roundtrip probe, so keep this shape buildable standalone. Its copy also
+# excludes src/rt/, which no longer exists here — harmless on both sides.
 SRCS=()
 while IFS= read -r f; do SRCS+=("$f"); done \
-    < <(find src -name '*.cpp' -not -path 'src/tools/*' -not -path 'src/rt/*' | sort)
+    < <(find src -name '*.cpp' -not -path 'src/tools/*' | sort)
 
 echo "building host wb_keygen + wb_encrypt..."
 "$CXX" "${CXXFLAGS[@]}" src/tools/wb_keygen.cpp  "${SRCS[@]}" "$SODIUM_A" -o "$BUILD/wb_keygen"

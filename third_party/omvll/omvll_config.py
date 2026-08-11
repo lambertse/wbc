@@ -52,7 +52,7 @@ _SENSITIVE_MODULES = (
 # dynamic attacker who traces one block recovers it regardless. Obfuscate the
 # COLD code that gates a cheap offline attack (seal/unseal + loader in
 # trusted_storage.cpp, the assembler, the SDK glue) heavily instead. See the
-# "performance trap" in the Pass-2 O-MVLL addendum / docs/ANTI-TAMPER.md.
+# "performance trap" note in docs/BUILD.md (O-MVLL section).
 _HOT_MODULES = ("vm.cpp", "handlers.cpp")
 
 # COLD gate TUs where MBA (arithmetic obfuscation) is worth its cost. These run
@@ -152,11 +152,12 @@ class Config(omvll.ObfuscationConfig):
     # functions (the `foo (.3)` / `foo.25` suffixes), and the anti-hook pass then
     # fails on the clone with
     #     error: Cannot inject a hooking prologue in the function <fn> since there is one.
-    # (observed on NDK r29 / O-MVLL v1.9.1 with flatten_functions enabled). The
-    # anti-hook / anti-DBI capability is provided instead by src/rt/anti_tamper.*
-    # (TracerPid / Frida-map / ptrace / timing, degrading silently into key
-    # derivation). If you ever want O-MVLL's version, enable it only on a function
-    # set that is NOT also flattened.
+    # (observed on NDK r29 / O-MVLL v1.9.1 with flatten_functions enabled).
+    #
+    # Nothing replaces it: this SDK has NO anti-hook / anti-DBI layer. An
+    # unwired sketch of one used to live in src/rt/ and was removed rather than
+    # left to read as a shipped capability. If you want O-MVLL's version, enable
+    # it only on a function set that is NOT also flattened.
     def anti_hooking(self, mod, func):
         return False
 

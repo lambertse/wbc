@@ -1,10 +1,11 @@
-# Portable build for standard toolchains. Mirrors build.sh (the tested path in
-# the dev environment, which has no system cmake). Dependencies are vendored
-# automatically at configure time by third_party/fetch_deps.sh. Usage:
+# Build for standard toolchains. This is the path that produces the SHIPPED
+# artifact: libwbcrypto.a for Android, via scripts/build_android.sh (NDK toolchain
+# file + this file). scripts/build_host.sh is the host-side sibling and builds no
+# library at all — only the tests and the two provisioning tools.
+# Dependencies are vendored at configure time by third_party/fetch_deps.sh. Usage:
 #   cmake -S . -B build && cmake --build build && ctest --test-dir build
 cmake_minimum_required(VERSION 3.16)
-# C is enabled because the SDK integration example (examples/keywrap.c) is C and
-# libsodium (the seal's KDF/AEAD dependency) is C.
+# C is enabled because libsodium (the seal's KDF/AEAD dependency) is C.
 project(whitebox_crypto_vm C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -188,37 +189,22 @@ add_library(wbvm STATIC
 target_include_directories(wbvm PUBLIC ${WBVM_INCLUDES})
 set_target_properties(wbvm PROPERTIES LINKER_LANGUAGE CXX)
 
-# Runtime SDK static + shared libraries (public C ABI). Runtime objects only.
+# THE shipped artifact: the runtime SDK static library (public C ABI). Runtime
+# objects only, so wbc_seal_key can never be linked into a shipped app.
+#
+# There is deliberately no SHARED sibling. The one consumer
+# (native-lib-encryption) links this archive into its own provider .so and hides
+# the wbc_* names there with -Wl,--exclude-libs,ALL, so a libwbcrypto.so was only
+# ever a second way to ship the same code — and it carried its own version script,
+# strip step and macOS/ELF link-flag divergence to maintain.
 add_library(wbcrypto_static STATIC
   $<TARGET_OBJECTS:wbvm_runtime_obj> $<TARGET_OBJECTS:sodium_obj>)
-add_library(wbcrypto_shared SHARED
-  $<TARGET_OBJECTS:wbvm_runtime_obj> $<TARGET_OBJECTS:sodium_obj>)
 set_target_properties(wbcrypto_static PROPERTIES OUTPUT_NAME wbcrypto)
-set_target_properties(wbcrypto_shared PROPERTIES OUTPUT_NAME wbcrypto)
-foreach(sdk wbcrypto_static wbcrypto_shared)
-  target_include_directories(${sdk} PUBLIC ${CMAKE_SOURCE_DIR}/include)
-  set_target_properties(${sdk} PROPERTIES LINKER_LANGUAGE CXX)
-endforeach()
+target_include_directories(wbcrypto_static PUBLIC ${CMAKE_SOURCE_DIR}/include)
+set_target_properties(wbcrypto_static PROPERTIES LINKER_LANGUAGE CXX)
 
-# Export only wbc_* from the shared library, gc dead code, and strip.
-target_link_options(wbcrypto_shared PRIVATE
-  -Wl,--version-script=${CMAKE_SOURCE_DIR}/src/sdk/wbcrypto.map
-  -Wl,--gc-sections
-  -Wl,--build-id=none)
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-  target_link_options(wbcrypto_shared PRIVATE -Wl,--strip-all)
-endif()
-# Belt-and-suspenders strip that also removes .comment/producer strings. On the
-# NDK path CMAKE_STRIP is llvm-strip; this is the step that reaches the SHIPPED
-# artifact (the source of the previous DWARF regression).
-if(CMAKE_STRIP)
-  add_custom_command(TARGET wbcrypto_shared POST_BUILD
-    COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment
-            $<TARGET_FILE:wbcrypto_shared>
-    COMMENT "strip libwbcrypto.so (symbols, debug, .comment)")
-endif()
-# The archive ships too, so give it the same treatment. Redundant with -g0 above
-# and deliberately so: it holds even if a future toolchain re-injects -g in a
+# The archive ships, so strip its debug info. Redundant with -g0 above and
+# deliberately so: it holds even if a future toolchain re-injects -g in a
 # position that beats ours.
 #
 # --strip-debug, NEVER --strip-all: an archive is not linked, so its symbol table
@@ -236,14 +222,6 @@ else()
   message(STATUS "archive strip: skipped (strip=${CMAKE_STRIP} android=${ANDROID} type=${CMAKE_BUILD_TYPE})")
 endif()
 
-# Host-only provisioning library (adds the keygen surface). Never shipped.
-add_library(wbprovision STATIC
-  $<TARGET_OBJECTS:wbvm_runtime_obj>
-  $<TARGET_OBJECTS:wbvm_provision_obj>
-  $<TARGET_OBJECTS:sodium_obj>)
-target_include_directories(wbprovision PUBLIC ${CMAKE_SOURCE_DIR}/include)
-set_target_properties(wbprovision PROPERTIES LINKER_LANGUAGE CXX)
-
 # Tools: wb_keygen needs the provisioning surface; wb_encrypt is runtime-only.
 # Both include internal headers under src/, so give them the internal include
 # roots (wbcrypto_static only exposes the public include/ dir).
@@ -256,32 +234,17 @@ target_include_directories(wb_encrypt PRIVATE ${WBVM_INCLUDES})
 # Benchmark. Links the RUNTIME library only (same shape as wb_encrypt above), so
 # it measures what actually ships and can never time the provisioning surface.
 # Deliberately NOT registered with add_test(): it asserts nothing, so it has no
-# business in ctest. Drive the O-MVLL on/off comparison with
-# scripts/bench_android.sh; see docs/BUILD.md ("Benchmarks").
+# business in ctest.
+#
+# It lives here, in the CMake path, because that is the only place it is useful:
+# the O-MVLL on/off A/B needs the NDK toolchain (the pass-plugin does not load into
+# a host compiler), and the numbers only mean anything on an arm64 device. Drive it
+# with scripts/bench_android.sh, which builds this target twice and runs both on a
+# phone; see docs/BUILD.md ("Benchmarks"). scripts/build_host.sh deliberately does
+# NOT build it.
 add_executable(wb_bench ${CMAKE_SOURCE_DIR}/bench/wb_bench.cpp)
 target_link_libraries(wb_bench PRIVATE wbcrypto_static)
 target_include_directories(wb_bench PRIVATE ${WBVM_INCLUDES} ${CMAKE_SOURCE_DIR}/bench)
-
-# Attribution ladder: plain AES vs the Chow table network vs the VM, to show what
-# the per-block cost is MADE OF. It generates its own white-box from a known key
-# (no blob, no KDF), so unlike wb_bench it MUST link the provisioning library —
-# aes_ref / wb_interp / wb_generator / the assembler all live there. That is why
-# it is a separate binary: wb_bench's runtime-only linkage is an invariant worth
-# keeping, and this target is host-side analysis, never shipped.
-add_executable(wb_ladder ${CMAKE_SOURCE_DIR}/bench/wb_ladder.cpp)
-target_link_libraries(wb_ladder PRIVATE wbprovision)
-target_include_directories(wb_ladder PRIVATE ${WBVM_INCLUDES} ${CMAKE_SOURCE_DIR}/bench)
-
-# C integration example (full lifecycle -> links the provisioning library).
-#   keywrap — the SDK's only shape: the white-box wraps a session key, a
-#             conventional AEAD moves the data.
-file(GLOB WBVM_EXAMPLES ${CMAKE_SOURCE_DIR}/examples/*.c)
-foreach(ex ${WBVM_EXAMPLES})
-    get_filename_component(exname ${ex} NAME_WE)
-    add_executable(${exname} ${ex})
-    target_link_libraries(${exname} PRIVATE wbprovision)
-    set_target_properties(${exname} PROPERTIES LINKER_LANGUAGE CXX)
-endforeach()
 
 # Tests (link the full source set).
 enable_testing()

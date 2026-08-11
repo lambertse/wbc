@@ -37,10 +37,9 @@ extern "C" {
 #define WBC_KEY_BYTES   16
 #define WBC_BLOCK_BYTES 16
 
-/* Session key for the bulk helpers below (XChaCha20-Poly1305). */
+/* The session key this SDK wraps: 32 bytes, the size a modern stream cipher or
+ * AEAD takes (ChaCha20, XChaCha20-Poly1305, AES-256). */
 #define WBC_SESSION_KEY_BYTES 32
-/* Bytes wbc_bulk_seal adds to the plaintext: 24-byte nonce + 16-byte tag. */
-#define WBC_BULK_OVERHEAD 40
 /* A wrapped session key on the wire: 16-byte IV || 32-byte wrapped key. */
 #define WBC_WRAPPED_KEY_BYTES 48
 
@@ -85,8 +84,13 @@ typedef enum wbc_status {
     WBC_ERR_ARG    = -1,  /* NULL/invalid argument or bad length          */
     WBC_ERR_FORMAT = -2,  /* malformed / truncated blob                   */
     WBC_ERR_NOMEM  = -3,  /* allocation failed                            */
-    WBC_ERR_AUTH   = -4   /* AEAD authentication failed (wrong key, or
-                           * the ciphertext was modified)                 */
+    WBC_ERR_AUTH   = -4   /* AEAD authentication failed. NOT CURRENTLY
+                           * RETURNED by any entry point: the seal's own tag
+                           * failure surfaces as WBC_ERR_FORMAT from
+                           * wbc_open, and the AEAD bulk helpers that used to
+                           * return this are gone. The value is retained so
+                           * the numbering stays stable for callers that
+                           * switch on it; handle it, do not expect it.      */
 } wbc_status;
 
 /* Opaque handle around a loaded, sealed white-box program. */
@@ -146,28 +150,34 @@ WBC_API wbc_status wbc_encrypt_block(wbc_ctx* ctx,
                                      const uint8_t in[WBC_BLOCK_BYTES],
                                      uint8_t out[WBC_BLOCK_BYTES]);
 
-/* ---- The one road: wrap a key with the white-box, move data with AEAD -----
+/* ---- The one road: wrap a key with the white-box, move the data yourself ---
  *
  * THE WHITE-BOX IS SLOW ON PURPOSE: every 16-byte block is thousands of
  * obfuscated VM instructions, so it runs at well under 1 MB/s. The slowness IS
  * the obfuscation -- it cannot be optimized away without deleting the
  * protection. So the SDK deliberately offers NO way to push bulk data through
- * it. Protect a *key* with the white-box and move the *data* conventionally:
+ * it, and no bulk cipher of its own: it protects a *key*, and YOU move the
+ * *data* with a conventional cipher of your choosing.
  *
  *   uint8_t sk[WBC_SESSION_KEY_BYTES], wrapped[WBC_WRAPPED_KEY_BYTES];
- *   wbc_random(sk, sizeof sk);                    // fresh session key
- *   wbc_wrap_key(ctx, sk, wrapped);               // white-box wraps it (2 blocks)
- *   wbc_bulk_seal(sk, data, n, out, &out_n);      // AEAD moves the payload
- *   wbc_wipe(sk, sizeof sk);                      // drop the plaintext key
+ *   wbc_random(sk, sizeof sk);        // fresh session key
+ *   wbc_wrap_key(ctx, sk, wrapped);   // white-box wraps it (2 blocks)
+ *   your_cipher_encrypt(sk, data, n); // ChaCha20 / AES-CTR / an AEAD -- yours
+ *   wbc_wipe(sk, sizeof sk);          // drop the plaintext key
  *
- * Store `wrapped` next to the sealed payload. To read it back:
+ * Store `wrapped` next to the payload. To read it back:
  *
  *   wbc_unwrap_key(ctx, wrapped, sk);
- *   wbc_bulk_open(sk, in, in_len, out, &out_n);
+ *   your_cipher_decrypt(sk, in, in_len);
  *   wbc_wipe(sk, sizeof sk);
  *
+ * `sk` is 32 bytes, so it drops straight into ChaCha20, XChaCha20-Poly1305 or
+ * AES-256 without further derivation. The worked example is the ChaCha20 mirror
+ * in native-lib-encryption's stub/stub_cipher.h, which decrypts a library's
+ * .text with exactly this shape.
+ *
  * The white-box cost is FIXED at two blocks per wrap -- it does not grow with
- * the payload, so only the AEAD scales. A 5 MiB round trip is ~13 ms per leg
+ * the payload, so only your cipher scales. A 5 MiB round trip is ~13 ms per leg
  * this way, against ~85 s if the payload itself went through the VM.
  *
  * WHAT THIS DOES AND DOES NOT PROTECT. The white-box protects the LONG-TERM key
@@ -187,9 +197,13 @@ WBC_API wbc_status wbc_encrypt_block(wbc_ctx* ctx,
  * session keys, and making the caller supply it made that an easy mistake.
  * Wrapping the same key twice therefore yields different bytes, by design.
  *
- * The wrap is NOT separately authenticated. A corrupted `wrapped` unwraps to a
- * wrong session key, and wbc_bulk_open then fails its tag with WBC_ERR_AUTH --
- * so corruption is detected where it matters, without a second MAC. */
+ * The wrap is NOT separately authenticated, and deliberately so. A corrupted
+ * `wrapped` simply unwraps to a DIFFERENT session key -- wbc_unwrap_key still
+ * returns WBC_OK, because CTR has nothing to check. Detecting that is your
+ * cipher's job: an AEAD fails its tag, and a bare stream cipher yields garbage
+ * plaintext you must be able to recognise. If your data path has no integrity
+ * check of its own, add one; do not read WBC_OK from wbc_unwrap_key as evidence
+ * that `wrapped` arrived intact. */
 WBC_API wbc_status wbc_wrap_key(wbc_ctx* ctx,
                                 const uint8_t session_key[WBC_SESSION_KEY_BYTES],
                                 uint8_t wrapped[WBC_WRAPPED_KEY_BYTES]);
@@ -205,21 +219,6 @@ WBC_API wbc_status wbc_random(uint8_t* buf, size_t len);
 
 /* Best-effort erase of sensitive memory; not optimized away by the compiler. */
 WBC_API void wbc_wipe(void* p, size_t len);
-
-/* Encrypt+authenticate `len` bytes under a session key (XChaCha20-Poly1305).
- * `out` must have room for len + WBC_BULK_OVERHEAD bytes; the nonce is chosen
- * randomly and prepended, so callers never manage nonces. *out_len receives the
- * bytes written. `in` and `out` must NOT overlap. */
-WBC_API wbc_status wbc_bulk_seal(const uint8_t key[WBC_SESSION_KEY_BYTES],
-                                 const uint8_t* in, size_t len,
-                                 uint8_t* out, size_t* out_len);
-
-/* Inverse of wbc_bulk_seal. `len` is the sealed length (>= WBC_BULK_OVERHEAD);
- * `out` needs len - WBC_BULK_OVERHEAD bytes. Returns WBC_ERR_AUTH if the data
- * or key is wrong -- on failure nothing is written. `in`/`out` must NOT overlap. */
-WBC_API wbc_status wbc_bulk_open(const uint8_t key[WBC_SESSION_KEY_BYTES],
-                                 const uint8_t* in, size_t len,
-                                 uint8_t* out, size_t* out_len);
 
 /* Release a context. */
 WBC_API void wbc_close(wbc_ctx* ctx);

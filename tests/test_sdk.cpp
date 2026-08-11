@@ -114,38 +114,9 @@ int main() {
         CHECK(wbc_wrap_key(ctx, nullptr, wrapped) == WBC_ERR_ARG);
         CHECK(wbc_unwrap_key(ctx, wrapped, nullptr) == WBC_ERR_ARG);
 
-        // Bulk round-trip, including a 0-length payload and an odd length.
-        for (size_t n : {size_t{0}, size_t{1}, size_t{4095}}) {
-            std::vector<uint8_t> in(n), sealed(n + WBC_BULK_OVERHEAD), opened(n ? n : 1);
-            for (size_t i = 0; i < n; ++i) in[i] = static_cast<uint8_t>(i * 7 + 3);
-            size_t sealed_len = 0, opened_len = 0;
-            CHECK(wbc_bulk_seal(sk, in.data(), n, sealed.data(), &sealed_len) == WBC_OK);
-            CHECK(sealed_len == n + WBC_BULK_OVERHEAD);
-            CHECK(wbc_bulk_open(sk, sealed.data(), sealed_len, opened.data(),
-                                &opened_len) == WBC_OK);
-            CHECK(opened_len == n);
-            CHECK(n == 0 || std::memcmp(in.data(), opened.data(), n) == 0);
-
-            // Any single-bit change anywhere must fail authentication, and a
-            // wrong key must not decrypt.
-            sealed[sealed_len / 2] ^= 0x01;
-            CHECK(wbc_bulk_open(sk, sealed.data(), sealed_len, opened.data(),
-                                &opened_len) == WBC_ERR_AUTH);
-            sealed[sealed_len / 2] ^= 0x01;
-            uint8_t wrong[WBC_SESSION_KEY_BYTES];
-            std::memcpy(wrong, sk, sizeof wrong);
-            wrong[0] ^= 0x80;
-            CHECK(wbc_bulk_open(wrong, sealed.data(), sealed_len, opened.data(),
-                                &opened_len) == WBC_ERR_AUTH);
-        }
-
-        // Two seals of the same plaintext must differ (fresh random nonce).
-        uint8_t a[WBC_BULK_OVERHEAD + 8], b[WBC_BULK_OVERHEAD + 8];
-        const uint8_t msg[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-        size_t alen = 0, blen2 = 0;
-        CHECK(wbc_bulk_seal(sk, msg, sizeof msg, a, &alen) == WBC_OK);
-        CHECK(wbc_bulk_seal(sk, msg, sizeof msg, b, &blen2) == WBC_OK);
-        CHECK(alen == blen2 && std::memcmp(a, b, alen) != 0);
+        // There is no bulk round-trip to test: the SDK ships no bulk cipher, the
+        // caller moves the payload with its own. What used to be tested here was
+        // libsodium's AEAD, not ours.
 
         // wbc_wipe actually clears.
         wbc_wipe(sk, sizeof sk);
@@ -153,44 +124,48 @@ int main() {
         for (unsigned char c : sk) all_zero = all_zero && (c == 0);
         CHECK(all_zero);
 
-        // error paths on the bulk surface.
-        size_t dummy = 0;
-        CHECK(wbc_bulk_open(sk, a, WBC_BULK_OVERHEAD - 1, b, &dummy) == WBC_ERR_ARG);
-        CHECK(wbc_bulk_seal(nullptr, msg, sizeof msg, a, &dummy) == WBC_ERR_ARG);
         CHECK(wbc_random(nullptr, 4) == WBC_ERR_ARG);
     }
 
-    // ---- corrupting a wrapped key is detected downstream --------------------
-    // wbc_wrap_key is deliberately NOT separately authenticated: a corrupted
-    // wrapped key unwraps to a WRONG session key, and the AEAD then rejects the
-    // payload. That is the argument for not adding a second MAC, so it needs to
-    // be a test rather than a claim in a comment.
+    // ---- every byte of a wrapped key is load-bearing ------------------------
+    // wbc_wrap_key is deliberately NOT separately authenticated, so the header
+    // owes the caller a precise promise: unwrapping a corrupted `wrapped` still
+    // returns WBC_OK, but yields a DIFFERENT session key, which the caller's own
+    // cipher is then responsible for noticing.
+    //
+    // This used to be tested by handing the wrong key to wbc_bulk_open and
+    // watching the AEAD reject it — which really tested libsodium. Testing OUR
+    // code means asserting the promise directly, and over the WHOLE buffer: flip
+    // one bit in each of the 48 byte positions in turn and every one must change
+    // the recovered key. That covers the IV half and the ciphertext half, and it
+    // is what fails if the CTR keystream is ever truncated or an IV byte stops
+    // reaching the counter block — bugs a single spot-check at index 0 and index
+    // 16 would both walk straight past.
     {
         uint8_t sk[WBC_SESSION_KEY_BYTES], wrapped[WBC_WRAPPED_KEY_BYTES];
         CHECK(wbc_random(sk, sizeof sk) == WBC_OK);
         CHECK(wbc_wrap_key(ctx, sk, wrapped) == WBC_OK);
 
-        const uint8_t payload[64] = {0};
-        uint8_t sealed[64 + WBC_BULK_OVERHEAD], opened[64];
-        size_t sealed_len = 0, opened_len = 0;
-        CHECK(wbc_bulk_seal(sk, payload, sizeof payload, sealed, &sealed_len) == WBC_OK);
+        // Sanity: the pristine wrap round-trips, so a failure below is the
+        // corruption talking and not a broken wrap.
+        uint8_t good_sk[WBC_SESSION_KEY_BYTES];
+        CHECK(wbc_unwrap_key(ctx, wrapped, good_sk) == WBC_OK);
+        CHECK(std::memcmp(sk, good_sk, sizeof sk) == 0);
 
-        // Flip a bit in the wrapped key's ciphertext half...
-        wrapped[WBC_BLOCK_BYTES] ^= 0x01;
-        uint8_t bad_sk[WBC_SESSION_KEY_BYTES];
-        CHECK(wbc_unwrap_key(ctx, wrapped, bad_sk) == WBC_OK);   // unwrap cannot tell
-        CHECK(std::memcmp(sk, bad_sk, sizeof sk) != 0);          // but the key is wrong
-        CHECK(wbc_bulk_open(bad_sk, sealed, sealed_len, opened,
-                            &opened_len) == WBC_ERR_AUTH);       // and the AEAD catches it
-        wrapped[WBC_BLOCK_BYTES] ^= 0x01;
-
-        // ...and flipping the IV half is caught the same way.
-        wrapped[0] ^= 0x80;
-        CHECK(wbc_unwrap_key(ctx, wrapped, bad_sk) == WBC_OK);
-        CHECK(std::memcmp(sk, bad_sk, sizeof sk) != 0);
-        CHECK(wbc_bulk_open(bad_sk, sealed, sealed_len, opened,
-                            &opened_len) == WBC_ERR_AUTH);
-        std::printf("  [wrap] corrupted wrapped key -> WBC_ERR_AUTH from the AEAD\n");
+        for (size_t i = 0; i < WBC_WRAPPED_KEY_BYTES; ++i) {
+            wrapped[i] ^= 0x01;
+            uint8_t bad_sk[WBC_SESSION_KEY_BYTES];
+            // Unwrap cannot tell -- CTR has nothing to check.
+            CHECK(wbc_unwrap_key(ctx, wrapped, bad_sk) == WBC_OK);
+            // But the key it hands back is not the one that was wrapped.
+            CHECK(std::memcmp(sk, bad_sk, sizeof sk) != 0);
+            wrapped[i] ^= 0x01;
+        }
+        // ...and the buffer is back to pristine, so the flips really were undone.
+        CHECK(wbc_unwrap_key(ctx, wrapped, good_sk) == WBC_OK);
+        CHECK(std::memcmp(sk, good_sk, sizeof sk) == 0);
+        std::printf("  [wrap] all %d bytes of a wrapped key affect the unwrapped key\n",
+                    WBC_WRAPPED_KEY_BYTES);
     }
 
     // ---- KDF tiers ---------------------------------------------------------

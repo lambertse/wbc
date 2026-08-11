@@ -44,7 +44,7 @@
 # ENVIRONMENT: this script deliberately INHERITS your working O-MVLL shell rather
 # than reconstructing it. Export the same vars you use for a normal obfuscated
 # build before running (NDK, OMVLL_CONFIG, OMVLL_PYTHONPATH, DYLD_LIBRARY_PATH,
-# and PYTHONHOME if your CPython is under pyenv — see docs/BUILD.md Option C).
+# and PYTHONHOME if your CPython is under pyenv — see docs/BUILD.md (O-MVLL section)).
 # It warns about anything missing instead of guessing a value for you.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -122,7 +122,7 @@ fi
 [ -n "${OMVLL_CONFIG:-}" ]     || warn "OMVLL_CONFIG is unset — the plugin will apply NO passes, making the A/B meaningless. export OMVLL_CONFIG=\$PWD/third_party/omvll/omvll_config.py"
 [ -n "${OMVLL_PYTHONPATH:-}" ] || warn "OMVLL_PYTHONPATH is unset — the plugin's embedded CPython will likely abort. export OMVLL_PYTHONPATH=\$PWD/third_party/python/Lib"
 if [ "$(uname -s)" = "Darwin" ] && [ -z "${DYLD_LIBRARY_PATH:-}" ]; then
-    warn "DYLD_LIBRARY_PATH is unset — the plugin may fail to load. See docs/BUILD.md Option C"
+    warn "DYLD_LIBRARY_PATH is unset — the plugin may fail to load. See docs/BUILD.md (O-MVLL section)"
 fi
 
 # Guard: the timing harness must NOT itself be a target of the obfuscator.

@@ -20,11 +20,16 @@ hardened with the obfuscation techniques from Tim Blazytko's
    plaintext block ─────────────────────▶ [VM: fetch-decode-execute] ──▶ ciphertext
 ```
 
-**New here?** Read **[docs/OVERVIEW.md](docs/OVERVIEW.md)** for a
-no-prerequisites explanation, then **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
-for the full component-by-component implementation. All docs:
-[OVERVIEW](docs/OVERVIEW.md) · [ARCHITECTURE](docs/ARCHITECTURE.md) ·
-[BUILD](docs/BUILD.md) · [ANTI-TAMPER](docs/ANTI-TAMPER.md).
+**New here?** Read on — this file is the overview. Then
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full
+component-by-component implementation, and **[docs/BUILD.md](docs/BUILD.md)** for
+how to build, seal a blob, and run the O-MVLL benchmark.
+
+**Scope.** This SDK exists to serve one consumer:
+[native-lib-encryption](https://github.com/lambertse/native-lib-encryption), which
+encrypts Android `.so` files and needs a white-box to protect the long-term key.
+The API is deliberately narrow to that contract — it wraps a *key* and ships no
+bulk cipher of its own.
 
 ## What it does
 
@@ -82,27 +87,35 @@ math — which is why the VM ISA is tiny.
 
 ## Build & run
 
-> Detailed guides: **[docs/BUILD.md](docs/BUILD.md)** (build & CLI) and the C ABI
-> header **[include/wbcrypto.h](include/wbcrypto.h)** (C library / FFI).
->
-> The project builds three ways from one core: the **CLI tools**
-> (`wb_keygen`/`wb_encrypt`), a **C-ABI SDK** (`libwbcrypto.a` / `libwbcrypto.so`
-> + `include/wbcrypto.h`) for embedding in native projects, and the test suite.
+> Detailed guide: **[docs/BUILD.md](docs/BUILD.md)**. The C ABI is documented in
+> **[include/wbcrypto.h](include/wbcrypto.h)**.
 
-No system cmake is required by the build script — it discovers a C++17 compiler
-(`$CXX`/`$ZIG_BIN`, then system `c++`/`g++`/`clang++`). One dependency,
-**libsodium** (the seal's KDF+AEAD), is vendored from source — `build.sh` fetches
-it automatically (pinned + SHA256). If you only have a Zig toolchain, drive it via
-`ZIG_BIN` (so `zig ar`/`zig cc` come along too):
+**Two jobs, two machines.** Sealing a key is a *pack-host* operation; the runtime is
+an *Android* artifact. Every script in `scripts/` is named for the one it does:
+
+| Command | Produces |
+|---|---|
+| `./scripts/build_android.sh` | `build-android/libwbcrypto.a` — **the only artifact that ships** |
+| `./scripts/gen_blob.sh` | `build-host/wb_keygen` + `wb_encrypt`, and a sealed `.blob` |
+| `./scripts/build_host.sh test` | the 7 test suites |
+| `./scripts/bench_android.sh` | the O-MVLL on/off A/B, on a device |
+
+No host build produces a shipping library, and there is no shared library at all —
+the consumer links `libwbcrypto.a` into its own `.so`.
+
+The correctness build needs no cmake; it discovers a C++17 compiler
+(`$ZIG_BIN`/`$CXX`, then system `c++`/`g++`/`clang++`). One dependency,
+**libsodium** (the seal's KDFs + AEAD), is vendored from source and fetched
+automatically (pinned + SHA256):
 
 ```sh
-./build.sh test                       # auto-fetches libsodium, builds, runs tests
-ZIG_BIN=/path/to/zig ./build.sh test  # when only a Zig toolchain is available
-./third_party/fetch_deps.sh           # (optional) vendor libsodium up front
+./scripts/build_host.sh test                       # auto-fetches libsodium, builds, runs tests
+ZIG_BIN=/path/to/zig ./scripts/build_host.sh test  # when only a Zig toolchain is available
+./third_party/fetch_deps.sh                        # (optional) vendor libsodium up front
 ```
 
-A `CMakeLists.txt` is also provided for standard toolchains (mirrors the script;
-`build.sh` is the tested path in this environment).
+`CMakeLists.txt` is the source of truth for the build graph;
+`scripts/build_android.sh` wraps it with the NDK toolchain file.
 
 ### CLI demo
 
@@ -117,7 +130,7 @@ A `CMakeLists.txt` is also provided for standard toolchains (mirrors the script;
 
 ## Verification
 
-`./build.sh test` runs:
+`./scripts/build_host.sh test` runs:
 
 * `test_aes_ref` — reference AES vs FIPS-197 known-answer + key expansion.
 * `test_wbaes` — white-box == AES at each stratum, FIPS vector + random blocks,
@@ -138,46 +151,55 @@ A `CMakeLists.txt` is also provided for standard toolchains (mirrors the script;
 
 ## Performance
 
-`bench/wb_bench.cpp` measures the shipped runtime (interpreter, block encryption,
-key wrap/unwrap, bulk AEAD, blob open and its KDF — the ECB/CTR metrics went with
-the bulk API in 2.0.0). The interesting question is what the O-MVLL native-code
-obfuscation costs, so `scripts/bench_android.sh` builds the benchmark **twice from
-identical sources** — plugin on and off — and runs both on a connected arm64 device,
-interleaved and CPU-pinned, then prints a per-surface ratio table:
+`bench/wb_bench.cpp` measures the shipped runtime: the interpreter, block
+encryption, key wrap/unwrap, blob open and its KDF. The interesting question is what
+the O-MVLL native-code obfuscation costs, so `scripts/bench_android.sh` builds the
+benchmark **twice from identical sources** — plugin on and off — and runs both on a
+connected arm64 device, interleaved and CPU-pinned, then prints a per-surface ratio
+table:
 
 ```sh
-./scripts/bench_android.sh                                    # on-device A/B
-./build/wb_bench --blob sealed.blob --pass demo                # host baseline
-./build/keywrap 5                                              # end-to-end, 5 MiB
+./scripts/bench_android.sh                     # on-device A/B — the real measurement
+./scripts/bench_android.sh --kdf light --no-build
 ```
+
+There is no host benchmark. The O-MVLL plugin is pinned to an NDK clang and will not
+load into a host compiler, so a host A/B would compare two *unobfuscated* builds —
+and the numbers that matter are a phone's anyway.
 
 ### One road: wrap a key, don't push data through the white-box
 
 The white-box runs well under 1 MB/s because every 16-byte block is thousands of
 obfuscated VM instructions. That slowness **is** the obfuscation — it cannot be
 optimized away without deleting the protection. So the SDK deliberately offers **no
-bulk entry point** (`wbc_encrypt_ecb` and `wbc_crypt_ctr` were removed in 2.0.0).
-Protect a **key** with the white-box and move the **data** with a conventional AEAD:
+bulk entry point**, and no bulk cipher of its own: it protects a **key**, and you
+move the **data** with a conventional cipher of your choosing.
 
 ```c
 uint8_t sk[WBC_SESSION_KEY_BYTES], wrapped[WBC_WRAPPED_KEY_BYTES];
-wbc_random(sk, sizeof sk);                 /* fresh session key            */
-wbc_wrap_key(ctx, sk, wrapped);            /* white-box wraps it, 2 blocks */
-wbc_bulk_seal(sk, data, n, out, &out_n);   /* AEAD moves the payload       */
-wbc_wipe(sk, sizeof sk);                   /* drop the plaintext key       */
+wbc_random(sk, sizeof sk);         /* fresh session key            */
+wbc_wrap_key(ctx, sk, wrapped);    /* white-box wraps it, 2 blocks */
+your_cipher_encrypt(sk, data, n);  /* ChaCha20 / AES-CTR / an AEAD */
+wbc_wipe(sk, sizeof sk);           /* drop the plaintext key       */
 ```
 
-Store `wrapped` next to the sealed payload — it carries its own IV, generated inside
-`wbc_wrap_key` so it cannot be reused. To read back: `wbc_unwrap_key` then
-`wbc_bulk_open`. `examples/keywrap.c` is the runnable version.
+Store `wrapped` next to the payload — it carries its own IV, generated inside
+`wbc_wrap_key` so it cannot be reused. To read back: `wbc_unwrap_key`, then your
+cipher. `sk` is 32 bytes, so it drops straight into ChaCha20, XChaCha20-Poly1305 or
+AES-256 with no further derivation. The worked example is the ChaCha20 mirror in
+[native-lib-encryption](https://github.com/lambertse/native-lib-encryption)'s
+`stub/stub_cipher.h`, which decrypts a library's `.text` exactly this way.
 
 **The white-box charge is fixed at two blocks per wrap** — it does not grow with the
-payload, so only the AEAD term scales. Measured: a 5 MiB round trip is **~13 ms per
-leg**, against ~85 s if the payload itself went through the VM.
+payload, so the only term that scales is your own cipher. For reference, that
+consumer reports ~13.7 ms total for a 5.5 MB `.text`: 1.1 ms open, 0.83 ms unwrap,
+11.8 ms of its own ChaCha20 — against ~85 s if the payload itself went through the VM.
 
-The wrap is not separately authenticated: a corrupted `wrapped` unwraps to a wrong
-session key and `wbc_bulk_open` then fails its tag with `WBC_ERR_AUTH`, so corruption
-is caught where it matters without a second MAC.
+**The wrap is not separately authenticated**, and that is a contract you have to
+honour. A corrupted `wrapped` still unwraps with `WBC_OK`; it just yields a
+*different* session key. Detecting that is your cipher's job — an AEAD fails its tag,
+a bare stream cipher gives you garbage you must be able to recognise. Never read
+`WBC_OK` from `wbc_unwrap_key` as evidence that `wrapped` arrived intact.
 
 **What this does and does not protect:** the white-box protects the long-term key —
 that key is never reconstructed. It does **not** extend that guarantee to the session
@@ -209,8 +231,10 @@ layer-by-layer picture:
   The seal uses XChaCha20-Poly1305 (authenticated) under a passphrase-derived
   key, which resists tampering and — at the Argon2id tiers — offline passphrase
   guessing. But an attacker who runs the field binary **has** the passphrase, so
-  durable protection needs hardware-backed device binding
-  (`src/rt/device_binding.*`, roadmap).
+  durable protection needs hardware-backed device binding — Android Keystore /
+  StrongBox — which this SDK does **not** implement. A sketch of it used to sit in
+  `src/rt/`, compiled into nothing and validated on no device; it was removed
+  rather than left to read as a feature. Treat it as unaddressed.
 
   That last point is exactly why the KDF cost is a per-blob tier rather than a
   constant. When the passphrase ships inside the binary that opens the blob —

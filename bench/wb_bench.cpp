@@ -4,9 +4,9 @@
 //            [--csv] [--label TAG] [--only METRIC,...]
 //
 // Built twice from identical sources (O-MVLL plugin on / off) and compared, this
-// answers the question docs/ANTI-TAMPER.md poses but cannot currently verify:
-// "Benchmark wbc_encrypt_block after enabling CFF/MBA and pick a level you can
-// afford." Drive both builds + the device run with scripts/bench_android.sh.
+// answers the question docs/BUILD.md poses under "Option C": benchmark
+// wbc_encrypt_block after enabling CFF/MBA and pick a level you can afford.
+// Drive both builds + the device run with scripts/bench_android.sh.
 //
 // ┌─ WHY THIS FILE IS NAMED `wb_bench.cpp` ────────────────────────────────────┐
 // │ O-MVLL targeting in third_party/omvll/omvll_config.py matches module names  │
@@ -39,7 +39,7 @@
 #include <string>
 #include <vector>
 
-#include "measure.h"  // bench::Measure / bench::Result — shared with wb_ladder
+#include "measure.h"  // bench::Measure / bench::Result — the timing harness
 #include "storage/trusted_storage.h"
 #include "vm/vm.h"
 #include "wbcrypto.h"
@@ -56,11 +56,6 @@ using bench::Result;
 // duplicate would not merely drift, it would time a KDF the blob does not use.
 constexpr size_t kKeyBytes = crypto_aead_xchacha20poly1305_ietf_KEYBYTES;  // 32
 constexpr size_t kSaltBytes = crypto_pwhash_SALTBYTES;                    // 16
-
-// Buffer size for the bulk-mode measurements: large enough to amortize the
-// per-call cost of the SDK entry point over many blocks, small enough to stay
-// in L1/L2 on a phone.
-constexpr size_t kBulkBytes = 4096;
 
 std::string ToHex(const uint8_t* p, size_t n) {
     static const char* h = "0123456789abcdef";
@@ -118,9 +113,9 @@ bool Want(const char* name) { return g_only.empty() || g_only.count(name) != 0; 
 // Every metric name this binary can emit — used to reject a typo in --only
 // rather than silently producing a CSV with a metric missing, which downstream
 // would read as "that metric did not exist in this build".
-const char* const kAllMetrics[] = {"vm_run",     "data_copy",    "encrypt_block",
-                                   "wrap_key",   "unwrap_key",   "bulk_seal_4k",
-                                   "open",       "kdf"};
+const char* const kAllMetrics[] = {"vm_run",   "data_copy",  "encrypt_block",
+                                   "wrap_key", "unwrap_key", "open",
+                                   "kdf"};
 
 }  // namespace
 
@@ -339,26 +334,10 @@ int main(int argc, char** argv) {
                 return acc;
             }));
     }
-    if (Want("bulk_seal_4k")) {   // The other half of the only path: conventional AEAD over the payload.
-        // This is what actually scales with data, and it is NOT white-box
-        // protected — see the caveat in wbcrypto.h.
-        uint8_t sk[WBC_SESSION_KEY_BYTES];
-        if (wbc_random(sk, sizeof sk) != WBC_OK) { wbc_close(ctx); return 1; }
-        std::vector<uint8_t> in(kBulkBytes), out(kBulkBytes + WBC_BULK_OVERHEAD);
-        for (size_t i = 0; i < in.size(); ++i) in[i] = static_cast<uint8_t>(i);
-        results.push_back(
-            Measure("bulk_seal_4k", min_ms, reps, kBulkBytes, 0, true, sink, [&](uint64_t n) {
-                uint64_t acc = 0;
-                size_t out_len = 0;
-                for (uint64_t i = 0; i < n; ++i) {
-                    if (wbc_bulk_seal(sk, in.data(), in.size(), out.data(), &out_len) != WBC_OK)
-                        return acc;
-                    acc += out[0];
-                }
-                return acc;
-            }));
-        wbc_wipe(sk, sizeof sk);
-    }
+    // There is no bulk case here any more. The SDK ships no bulk cipher — the
+    // caller moves the payload itself — so the only thing such a case could time
+    // is the payload cipher of whoever links us, which is not ours to measure and
+    // is not touched by the O-MVLL config this benchmark exists to A/B.
     if (Want("open")) {   // Cold gate path. trusted_storage.cpp gets the heaviest pass set
         // (flatten + MBA + opaque constants + string encoding). At the high tier
         // Argon2id dominates the wall clock and this number alone hides that
@@ -414,12 +393,12 @@ int main(int argc, char** argv) {
         }));
     }
 
-    // NOTE: there is deliberately no large-payload pass here any more. The SDK
-    // offers no way to push bulk data through the white-box (wbc_encrypt_ecb and
-    // wbc_crypt_ctr were removed in 2.0.0), so "how long does 5 MB take?" is now
-    // answered by wrap_key + bulk_seal_4k: a fixed ~0.5 ms of white-box work
-    // plus conventional AEAD over the payload. examples/keywrap.c shows the
-    // end-to-end number.
+    // NOTE: there is deliberately no large-payload pass here. The SDK offers no
+    // way to push bulk data through the white-box (wbc_encrypt_ecb and
+    // wbc_crypt_ctr went in 2.0.0) and no bulk cipher of its own, so "how long
+    // does 5 MB take?" is not a question this binary can answer: the answer is
+    // `wrap_key` (fixed, ~0.5 ms, measured above) plus however long the CALLER's
+    // cipher takes over the payload, which belongs in the caller's own benchmark.
 
     // ---- report ------------------------------------------------------------
     const std::string ct_hex = ToHex(ct_vm.data(), 16);
@@ -497,14 +476,12 @@ int main(int argc, char** argv) {
     const Result* open = nullptr;
     const Result* kdf = nullptr;
     const Result* wrap = nullptr;
-    const Result* seal = nullptr;
     for (const Result& r : results) {
         if (r.name == "vm_run") vm = &r;
         if (r.name == "data_copy") copy = &r;
         if (r.name == "open") open = &r;
         if (r.name == "kdf") kdf = &r;
         if (r.name == "wrap_key") wrap = &r;
-        if (r.name == "bulk_seal_4k") seal = &r;
     }
 
     // Subtractions use min_ns, not median_ns: under additive noise (scheduler,
@@ -523,16 +500,16 @@ int main(int argc, char** argv) {
                     100.0 * copy->min_ns / vm->min_ns);
         std::printf("                         really is the interpreter's own cost)\n");
     }
-    // What a payload actually costs now: a FIXED white-box charge (the wrap) plus
-    // conventional AEAD that scales. Printed as a per-MiB projection of the AEAD
-    // half only, because the wrap does not grow with the payload — which is the
-    // whole point of the design and the thing a reader must not get wrong.
-    if (wrap && seal && seal->mb_s > 0) {
-        const double aead_s_per_mib = 1.048576 / seal->mb_s;  // MiB / (MB/s)
-        std::printf("    per payload        : %.2f ms fixed (wrap) + %.1f ms per MiB (AEAD)\n",
-                    wrap->min_ns / 1e6, aead_s_per_mib * 1000.0);
-        std::printf("                         The wrap is 2 white-box blocks whatever the\n");
-        std::printf("                         payload size, so only the AEAD term scales.\n");
+    // What a payload costs: a FIXED white-box charge (the wrap) plus the caller's
+    // own cipher over the data. Only the fixed half is ours to report, and saying
+    // so explicitly is the point — a reader must not come away thinking the
+    // white-box cost scales with the payload, because it does not.
+    if (wrap) {
+        std::printf("    per payload        : %.2f ms fixed (wrap), whatever the payload size\n",
+                    wrap->min_ns / 1e6);
+        std::printf("                         The wrap is 2 white-box blocks. The term that\n");
+        std::printf("                         scales is your own cipher over the data, which\n");
+        std::printf("                         this SDK does not provide and cannot time.\n");
     }
     if (open && kdf) {
         const double diff = open->min_ns - kdf->min_ns;

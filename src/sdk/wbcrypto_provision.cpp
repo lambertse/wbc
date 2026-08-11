@@ -5,7 +5,7 @@
 // the white-box generator, and the bytecode assembler.
 //
 // It MUST NOT ship in the field runtime library (libwbcrypto.{a,so}); it is
-// linked only into the provisioning tools (wb_keygen) and libwbprovision.a,
+// linked only into the provisioning tools (wb_keygen) and the tests,
 // which stay on the build/provisioning host. Shipping GenerateWhiteBox next to
 // the runtime would put the reference cipher and the table generator on the
 // attacker's device. See docs/BUILD.md.

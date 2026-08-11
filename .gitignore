@@ -1,5 +1,4 @@
 /build/
-/integration_test/build/
 *.o
 *.blob
 .DS_Store
