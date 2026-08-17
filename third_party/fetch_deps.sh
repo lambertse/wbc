@@ -96,32 +96,65 @@ fetch_python() {
 
 # ---- O-MVLL plugin (native-code obfuscator) --------------------------------
 # The O-MVLL LLVM pass-plugin, pinned to v1.9.1 / NDK r29 (the config in
-# third_party/omvll/omvll_config.py targets this build). The macOS release
-# tarball ships two plugin variants plus a matching Python-3.10.7 stdlib; we
-# install the NDK plugin as omvll_ndk_r29.dylib and, since it's already
-# extracted, reuse the bundled (version-matched) stdlib to satisfy the python
-# dep without a second download. The plugin is a Mach-O dylib — it only *loads*
-# on macOS, but fetching/placing it anywhere is harmless.
-OMVLL_SHA256="0471e049b21e7ada4b52bb15bb4bc7d0be67ae385417d9cd78c27e48718470de"
-OMVLL_URL="https://github.com/open-obfuscator/o-mvll/releases/download/1.9.1/omvll_v1-9-1_macos_2026-07-08T15_08_58.tar.gz"
+# third_party/omvll/omvll_config.py targets this build). Upstream publishes a
+# per-host release and they are NOT interchangeable: the plugin is dlopen'd into
+# the NDK's clang, so a macOS build needs the Mach-O dylib and a Linux build
+# needs the ELF .so. Both tarballs ship a matching Python-3.10.7 stdlib, which we
+# reuse for the python dep rather than making a second download; the macOS one is
+# larger only because it carries two plugin variants (ndk + xcode) to Linux's one.
+#
+# omvll_plugin_path — the ONE place the per-host filename is decided. Sourced by
+# scripts/build_android.sh too, so the fetcher and the consumer cannot drift onto
+# different names (they did not use to be able to disagree; now they could).
+omvll_plugin_path() {
+    case "$(uname -s)" in
+        Darwin) echo "third_party/omvll/omvll_ndk_r29.dylib" ;;
+        Linux)  echo "third_party/omvll/omvll_ndk_r29.so" ;;
+        *)      echo "third_party/omvll/omvll_ndk_r29.unsupported" ;;
+    esac
+}
+
+OMVLL_MACOS_SHA256="0471e049b21e7ada4b52bb15bb4bc7d0be67ae385417d9cd78c27e48718470de"
+OMVLL_MACOS_URL="https://github.com/open-obfuscator/o-mvll/releases/download/1.9.1/omvll_v1-9-1_macos_2026-07-08T15_08_58.tar.gz"
+OMVLL_LINUX_SHA256="f1f8f88812e173ea44d74372502c4a09600810de3254dbae1f82599bfc339aa0"
+OMVLL_LINUX_URL="https://github.com/open-obfuscator/o-mvll/releases/download/1.9.1/omvll_v1-9-1_linux_2026-07-06T09_44_15.tar.gz"
+
 fetch_omvll() {
     local dest="third_party/omvll"
-    local plugin="${dest}/omvll_ndk_r29.dylib"
-    local stamp="${dest}/.vendored-ok"
+    local plugin; plugin="$(omvll_plugin_path)"
+    # Per-host stamp. A shared checkout (a git submodule mounted into a Linux
+    # container from a macOS working copy, say) has the macOS plugin AND a valid
+    # stamp, and a single stamp would report "already vendored" while the .so this
+    # host needs is absent. Keying the stamp to the host makes that self-correcting.
+    local stamp="${dest}/.vendored-ok-$(uname -s)"
+    local url sha member
+    case "$(uname -s)" in
+        Darwin) url="$OMVLL_MACOS_URL"; sha="$OMVLL_MACOS_SHA256"; member="omvll-ndk.dylib" ;;
+        Linux)  url="$OMVLL_LINUX_URL"; sha="$OMVLL_LINUX_SHA256"; member="omvll-ndk.so" ;;
+        *) echo "ERROR: no O-MVLL release for $(uname -s); build with --no-omvll" >&2; exit 1 ;;
+    esac
+
     if [ -f "$stamp" ] && [ -f "$plugin" ]; then
         echo "O-MVLL plugin already vendored at ${plugin}"
     else
         mkdir -p "$dest"
-        local tarball="${dest}/omvll-v1.9.1-macos.tar.gz"
-        echo "downloading O-MVLL v1.9.1 plugin ..."
-        curl -sSL -o "$tarball" "$OMVLL_URL"
-        echo "verifying SHA256 ..."; verify_sha256 "$tarball" "$OMVLL_SHA256"
+        local tarball="${dest}/omvll-v1.9.1.tar.gz"
+        echo "downloading O-MVLL v1.9.1 plugin ($(uname -s)) ..."
+        curl -sSL -o "$tarball" "$url"
+        echo "verifying SHA256 ..."; verify_sha256 "$tarball" "$sha"
         local tmp; tmp="$(mktemp -d)"
         echo "extracting ..."; tar -xzf "$tarball" -C "$tmp"
-        # Install the NDK plugin under the repo's stable name.
-        local dylib; dylib="$(find "$tmp" -name 'omvll-ndk.dylib' -print -quit)"
-        [ -n "$dylib" ] || { echo "ERROR: omvll-ndk.dylib not found in tarball" >&2; exit 1; }
-        cp "$dylib" "$plugin"
+        # Install the NDK plugin under the repo's stable per-host name. Name the
+        # tarball's actual contents on a miss: upstream renaming a member is the
+        # realistic breakage here, and "not found" alone would send you reading
+        # this script instead of the listing that answers it.
+        local found; found="$(find "$tmp" -name "$member" -print -quit)"
+        if [ -z "$found" ]; then
+            echo "ERROR: $member not found in the O-MVLL tarball. It contains:" >&2
+            (cd "$tmp" && find . -maxdepth 2 -name 'omvll*' -o -maxdepth 1 -type f) >&2
+            rm -rf "$tmp" "$tarball"; exit 1
+        fi
+        cp "$found" "$plugin"
         # Reuse the bundled, version-matched CPython stdlib for the python dep
         # (avoids a redundant python.org download) unless already vendored.
         if [ ! -f "third_party/python/.vendored-ok" ]; then
@@ -137,9 +170,26 @@ fetch_omvll() {
     fi
     # Guarantee the python dep is present even if the bundle path was skipped.
     fetch_python
+    # ...and that it is REAL, not merely stamped. fetch_python short-circuits on
+    # third_party/python/.vendored-ok, so a stamp left over an incomplete tree
+    # would sail through both branches above and only fail much later, inside the
+    # plugin, as "failed to get the Python codec of the filesystem encoding".
+    [ -f "third_party/python/Lib/abc.py" ] || {
+        echo "ERROR: third_party/python is stamped as vendored but has no Lib/abc.py." >&2
+        echo "       The O-MVLL plugin embeds CPython 3.10 and aborts without that stdlib." >&2
+        echo "       Fix: rm -rf third_party/python && ./third_party/fetch_deps.sh python" >&2
+        exit 1; }
 }
 
 # ---- dispatch --------------------------------------------------------------
+# Only when EXECUTED. scripts/build_android.sh sources this file to reuse
+# omvll_plugin_path (one definition of the per-host plugin filename, rather than
+# two that can drift), and a sourced script that fetches libsodium as a side
+# effect would be a trap.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
+
 [ "$#" -eq 0 ] && set -- libsodium
 for target in "$@"; do
     case "$target" in

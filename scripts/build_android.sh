@@ -41,6 +41,9 @@
 #   PYTHONHOME          only if your CPython is under pyenv, e.g.
 #                       "$(pyenv root)/versions/3.10.7". Cannot be guessed.
 #   DYLD_LIBRARY_PATH   macOS only; may be needed for the plugin to load.
+#   LD_LIBRARY_PATH     the Linux counterpart. Usually unnecessary — the ELF
+#                       plugin links only libm/libz/libc — but set it if a
+#                       minimal container is missing libz.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -89,8 +92,24 @@ TOOLCHAIN="$NDK/build/cmake/android.toolchain.cmake"
 command -v cmake >/dev/null 2>&1 || die "cmake not found"
 command -v ninja >/dev/null 2>&1 || die "ninja not found (this path uses -GNinja)"
 
-PLUGIN="$ROOT/third_party/omvll/omvll_ndk_r29.dylib"
+# Per-host: the plugin is dlopen'd into the NDK's clang, so macOS needs the Mach-O
+# dylib and Linux the ELF .so. omvll_plugin_path comes from fetch_deps.sh rather
+# than being duplicated here - two copies of this filename could drift, and the
+# symptom would be "plugin still missing" naming a path the fetcher had just
+# written under the other name. Sourcing is safe: fetch_deps.sh returns before
+# its dispatch when it is not the executed script.
+# shellcheck source=third_party/fetch_deps.sh
+. "$ROOT/third_party/fetch_deps.sh"
+PLUGIN="$ROOT/$(omvll_plugin_path)"
 if [ "$USE_OMVLL" -eq 1 ]; then
+    # Upstream publishes the Linux plugin for x86_64 only. Checked BEFORE the
+    # fetch below, so an unsupported host is told so instead of downloading 48 MB
+    # it cannot use. clang's own failure to load a foreign-arch plugin is a
+    # generic plugin error that never mentions the architecture.
+    if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" != "x86_64" ]; then
+        die "the O-MVLL Linux plugin is x86_64-only and this host is $(uname -m).
+       Build on an x86_64 host, or pass --no-omvll."
+    fi
     # Fetched on demand, exactly as -DOMVLL=ON would do.
     if [ ! -f "$PLUGIN" ]; then
         say "fetching the O-MVLL plugin (not committed)"
@@ -112,6 +131,9 @@ if [ "$USE_OMVLL" -eq 1 ]; then
        Run ./third_party/fetch_deps.sh python"
 
     # PYTHONHOME cannot be guessed — it depends on how your CPython is installed.
+    # In a container it is normally fine unset: OMVLL_PYTHONPATH above points at
+    # the version-matched stdlib the release tarball bundles, which is what the
+    # embedded interpreter actually reads.
     [ -n "${PYTHONHOME:-}" ] || warn "PYTHONHOME is unset. If your CPython is under pyenv the
       plugin will abort; export PYTHONHOME=\"\$(pyenv root)/versions/3.10.7\""
     if [ "$(uname -s)" = "Darwin" ] && [ -z "${DYLD_LIBRARY_PATH:-}" ]; then

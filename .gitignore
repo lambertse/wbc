@@ -9,9 +9,12 @@ __pycache__/
 third_party/libsodium/
 third_party/python/
 # O-MVLL: the fetched plugin binary, stamp, and download leftovers are ignored;
-# the hand-authored omvll_config.py stays tracked.
+# the hand-authored omvll_config.py stays tracked. Both host variants of the
+# plugin, and the per-host stamps (.vendored-ok-Darwin / -Linux), since one
+# checkout can be built from more than one host.
 third_party/omvll/*.dylib
-third_party/omvll/.vendored-ok
+third_party/omvll/*.so
+third_party/omvll/.vendored-ok*
 third_party/*.tgz
 third_party/omvll/*.tar.gz
 /build-host/
