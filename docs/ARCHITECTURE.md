@@ -337,8 +337,9 @@ ciphertext[data_len + 16]
   and the blob does not open at all. There is no separate MAC because the AEAD
   is the MAC.
 
-A wrong passphrase (or a tampered blob) does **not** error — it yields a program
-that runs and produces wrong ciphertext, by design (no oracle for the attacker).
+For the end-to-end provisioning walkthrough — and specifically which bytes of the
+blob are key-derived, seed-derived or random — see
+[technical/seal-blob-flow.md](technical/seal-blob-flow.md).
 
 ### 6.1 The KDF cost tier
 
@@ -488,7 +489,7 @@ blob ─► Unseal ─► vm::Program ─► Run:
 | White-box tables (in memory) | ~1.5 MB (`WhiteBox`) |
 | VM DATA image | 409,648 B (tables + 3×16 B scratch) |
 | Hardened bytecode | ~58 KB, entropy ≈ 7.997 bits/byte |
-| Sealed blob (hardened) | ~468 KB |
+| Sealed blob (hardened) | 454,852 B = 444 KiB (584 B header+maps, 44,604 B code, 409,664 B ciphertext+tag) |
 | FIPS-197 anchor | key `000102…0f`, pt `001122…ff` → ct `69c4e0d8…c55a` |
 
 ---

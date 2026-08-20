@@ -24,6 +24,9 @@ hardened with the obfuscation techniques from Tim Blazytko's
 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full
 component-by-component implementation, and **[docs/BUILD.md](docs/BUILD.md)** for
 how to build, seal a blob, and run the O-MVLL benchmark.
+**[docs/technical/seal-blob-flow.md](docs/technical/seal-blob-flow.md)** walks the
+seal flow end to end — inputs, blob layout, and what is key-derived, seed-derived
+or random.
 
 **Scope.** This SDK exists to serve one consumer:
 [native-lib-encryption](https://github.com/lambertse/native-lib-encryption), which
